@@ -1,6 +1,6 @@
 // --- .env first ---
 const path = require('node:path');
-const { fileURLToPath } } = require('node:url');
+const { fileURLToPath } = require('node:url');
 const fs = require('node:fs');
 const dotenv = require('dotenv');
 
