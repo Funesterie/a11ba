@@ -191,18 +191,20 @@ async function apiPost(path: string, body: unknown, provider: Provider = 'local'
 export async function chatCompletion(
   messages: Msg[],
   provider: Provider = 'local',
-  systemPromptOrOptions?: string | { turbo?: boolean; systemPrompt?: string; a11Dev?: boolean }
+  systemPromptOrOptions?: string | { turbo?: boolean; systemPrompt?: string; a11Dev?: boolean; model?: string }
 ) {
   // Support both old signature (systemPrompt string) and new options object
   let systemPrompt: string | undefined;
   let turboFlag = false;
   let a11DevFlag = false;
+  let modelOverride: string | undefined;
   if (typeof systemPromptOrOptions === 'string') {
     systemPrompt = systemPromptOrOptions;
   } else if (typeof systemPromptOrOptions === 'object' && systemPromptOrOptions !== null) {
     systemPrompt = systemPromptOrOptions.systemPrompt;
     turboFlag = !!systemPromptOrOptions.turbo;
     a11DevFlag = !!systemPromptOrOptions.a11Dev;
+    modelOverride = systemPromptOrOptions.model;
   }
 
   // Ajout du systemPrompt si fourni
@@ -219,7 +221,7 @@ export async function chatCompletion(
 
   const payload = {
     provider,
-    model: getModelForProvider(provider),
+    model: modelOverride || getModelForProvider(provider),
     messages: msgs,
     stream: false,
     temperature: turboFlag ? 0.3 : 0.7,

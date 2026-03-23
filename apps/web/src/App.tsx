@@ -13,7 +13,7 @@ import {
 } from "./lib/speech";
 import handleImportFiles from "./lib/importer";
 import { mountA11AvatarUI } from "./lib/avatar-ui";
-import { chatCompletion, callA11Agent, type A11ChatMessage } from "./lib/api";
+import { chatCompletion, callA11Agent, type A11ChatMessage, type Provider } from "./lib/api";
 
 type Role = "user" | "assistant" | "system";
 
@@ -91,7 +91,7 @@ export function App() {
   const [speaking, setSpeaking] = useState(false); // pour l'avatar animé
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const toggleLockRef = useRef(false);
-  const [model, setModel] = useState("llama3.2:latest");
+  const [model, setModel] = useState("gpt-4o-mini");
 
   // Chats state persisted in localStorage
   const [chats, setChats] = useState<{
@@ -229,10 +229,12 @@ export function App() {
       // Utilisation de chatCompletion pour transmettre le prompt et le flag dev
       // On reconstruit l'historique sans les messages système (le prompt système est passé séparément)
       const history = messages.filter(m => m.role !== 'system').concat(userMsg);
+      const provider: Provider = model.startsWith('gpt') ? 'openai' : 'local';
       const assistantText = await chatCompletion(
         history,
-        'local',
+        provider,
         {
+          model,
           systemPrompt: systemPrompt,
           a11Dev: devMode
         }
@@ -548,8 +550,8 @@ export function App() {
               marginRight: 2
             }}
           >
-            <option value="llama3.2:latest">llama3.2:latest</option>
             <option value="gpt-4o-mini">gpt-4o-mini</option>
+            <option value="gpt-4.1-mini">gpt-4.1-mini</option>
           </select>
           <MuteButton />
           {stats && (

@@ -97,10 +97,7 @@ console.log("[Cerbère] Workspace root:", WORKSPACE_ROOT);
 //    SECTION 2 — BACKENDS & MODEL SELECTION
 // ========================================================================
 const BACKENDS = {
-  llama_local: "http://127.0.0.1:8000",
-  ollama: OLLAMA_BASE,
-  openai: "https://api.openai.com/v1",
-  openai_local: "http://127.0.0.1:5001/v1",
+  openai: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
 };
 
 logInfo("[Cerbère] Backends configurés: " + JSON.stringify(BACKENDS));
@@ -136,11 +133,21 @@ logStrategist("[Cerbère] Strategist 64K initialisé");
 // 2.3 — SAFE BACKEND SELECTOR
 // -------------------------------------------
 function selectBackend(model) {
-  const m = (model || "").toLowerCase();
-  if (m.startsWith("gpt") || m.includes("openai")) return BACKENDS.openai;
-  if (m.includes("openai_local")) return BACKENDS.openai_local;
-  if (m.includes("ollama") || m.includes("olloma")) return BACKENDS.ollama;
-  return BACKENDS.llama_local;
+  return BACKENDS.openai;
+}
+
+function buildOpenAICompletionsUrl(baseUrl) {
+  const normalized = (baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
+  if (normalized.endsWith("/v1")) return `${normalized}/chat/completions`;
+  return `${normalized}/v1/chat/completions`;
+}
+
+function buildUpstreamHeaders(backendBase) {
+  const headers = { "Content-Type": "application/json" };
+  if (process.env.OPENAI_API_KEY) {
+    headers.Authorization = `Bearer ${process.env.OPENAI_API_KEY}`;
+  }
+  return headers;
 }
 
 // -------------------------------------------
@@ -155,43 +162,20 @@ function extractUserPrompt(messages = []) {
 //   SECTION 3 — STRATEGIST / THINKER / MAKER / PIPELINE
 // ========================================================================
 async function callStrategist(userPrompt) {
-  logStrategist("[Cerbère][STRATÉGISTE] Analyse & planification (Ollama 64K)");
-
-  const body = {
-    model: STRATEGIST_BACKEND.model,
-    prompt: userPrompt,
-    options: STRATEGIST_BACKEND.options,
-  };
-
-  try {
-    const resp = await fetch(STRATEGIST_BACKEND.url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    const data = await resp.json();
-    const text = data?.response || data?.text || JSON.stringify(data);
-    return String(text).trim();
-  } catch (err) {
-    logStrategist("[Cerbère][STRATÉGISTE] ERREUR : " + err.message);
-    return "ERREUR_STRATEGISTE";
-  }
+  logStrategist("[Cerbère][STRATÉGISTE] Analyse OpenAI");
+  return await callThinker(`Planifie clairement la meilleure réponse à cette demande:\n${userPrompt}`);
 }
 
 async function callThinker(prompt) {
   logThinker("[Cerbère][THINKER] GPT-4.1 engagé pour analyse");
 
-  const backendURL = BACKENDS.openai.replace(/\/$/, "") + "/chat/completions";
+  const backendURL = buildOpenAICompletionsUrl(BACKENDS.openai);
   const body = { model: "gpt-4.1", messages: [{ role: "user", content: prompt }] };
 
   try {
     const resp = await fetch(backendURL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
+      headers: buildUpstreamHeaders(BACKENDS.openai),
       body: JSON.stringify(body),
     });
 
@@ -205,17 +189,17 @@ async function callThinker(prompt) {
 }
 
 async function callMaker(input) {
-  logMaker("[Cerbère][MAKER] LLaMA engagé pour exécution");
+  logMaker("[Cerbère][MAKER] OpenAI engagé pour exécution");
 
-  const backendURL = BACKENDS.llama_local.replace(/\/$/, "") + "/v1/chat/completions";
+  const backendURL = buildOpenAICompletionsUrl(BACKENDS.openai);
   const messages = Array.isArray(input) ? input : [{ role: "user", content: input }];
 
-  const body = { model: "llama3.2:latest", messages };
+  const body = { model: "gpt-4o-mini", messages };
 
   try {
     const resp = await fetch(backendURL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: buildUpstreamHeaders(BACKENDS.openai),
       body: JSON.stringify(body),
     });
 
@@ -623,7 +607,9 @@ router.post("/v1/chat/completions", async (req, res) => {
     }
 
     // 4) MAKER + DEV ENGINE loop
-    const backendUrl = selectBackend(model).replace(/\/$/, "") + "/v1/chat/completions";
+    const backendBase = selectBackend(model);
+    const backendUrl = buildOpenAICompletionsUrl(backendBase);
+    const upstreamHeaders = buildUpstreamHeaders(backendBase);
 
     let toolResults = [];
     let loopCount = 0;
@@ -636,7 +622,7 @@ router.post("/v1/chat/completions", async (req, res) => {
       const upstreamBody = { ...body, model, messages, stream };
       const upstreamRes = await fetch(backendUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: upstreamHeaders,
         body: JSON.stringify(upstreamBody),
       });
 
@@ -677,7 +663,7 @@ ${userPrompt}
 
       const upstreamRes = await fetch(backendUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: upstreamHeaders,
         body: JSON.stringify(upstreamBody),
       });
 

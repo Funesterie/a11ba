@@ -45,8 +45,8 @@ const CTX_SIZE = Number(process.env.CTX_SIZE) || 8192;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 4096;
 const PARALLEL = Number(process.env.PARALLEL) || 8;
 
-// Set remote qflush URL for production
-process.env.QFLUSH_REMOTE_URL = 'https://qflush-production.up.railway.app';
+// Set remote qflush URL for production (allow env override)
+process.env.QFLUSH_REMOTE_URL = process.env.QFLUSH_REMOTE_URL || 'https://qflush-production.up.railway.app';
 
 // -------------------
 
