@@ -1,0 +1,11 @@
+{
+  "name": "a11ba",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "echo 'Build done'",
+    "start": "cd apps/server && npm start"
+  },
+  "engines": {
+    "node": "18"
+  }
+}
