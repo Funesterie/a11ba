@@ -1,0 +1,40 @@
+# Local Netlify folder
+.netlify
+
+# Local environment variables
+.env
+# Per-app local env files (do not commit secrets)
+apps/server/.env.local
+apps/web/.env.local
+
+# Encrypted env output (machine-protected)
+.env.enc
+
+# IDE files
+.vscode/
+.vs/
+
+# Visual Studio
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Web build output and legacy public assets
+apps/web/dist/
+apps/web/public/legacy/
+
+# Misc
+tools/qflush-vsix/
+Qflush.A11/.vs/
+
+# TTS output
+tts/out/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db

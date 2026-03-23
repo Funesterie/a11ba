@@ -1,0 +1,54 @@
+{
+  "name": "a11-server",
+  "version": "1.0.0",
+  "description": "Backend AlphaOnze server (Express)",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": "./dist/rome/engine.js"
+  },
+  "scripts": {
+    "dev": "node server.cjs",
+    "start": "node server.cjs",
+    "dev:router": "node llm-router.cjs",
+    "build": "cd ../web && npm install && npm run build",
+    "test": "echo 'No tests specified for server'",
+    "lint": "echo 'No linting configured for server'"
+  },
+  "dependencies": {
+    "@funeste38/bat": "^0.1.2",
+    "@funeste38/envaptex": "^1.0.0",
+    "@funeste38/freeland": "^0.1.0",
+    "@funeste38/nezlephant": "^0.1.0",
+    "@funeste38/qflush": "file:../../funeste38-qflush-4.0.3.tgz",
+    "@funeste38/rome": "^1.5.3",
+    "adm-zip": "^0.5.16",
+    "axios": "^1.13.2",
+    "canvas": "^3.2.0",
+    "compression": "^1.7.4",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.22.1",
+    "helmet": "^8.1.0",
+    "http-proxy-middleware": "^2.0.9",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^3.3.2",
+    "open": "^8.4.2",
+    "openai": "^6.9.1",
+    "pdfkit": "^0.17.2",
+    "playwright": "^1.57.0",
+    "react-markdown": "^10.1.0",
+    "sharp": "^0.34.5",
+    "tesseract.js": "^6.0.1",
+    "ws": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7"
+  }
+}
