@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Backend AlphaOnze server (Express)",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "exports": {
     ".": {
       "require": "./dist/index.js",
@@ -27,7 +30,6 @@
     "@funeste38/rome": "^1.5.3",
     "adm-zip": "^0.5.16",
     "axios": "^1.13.2",
-    "canvas": "^3.2.0",
     "compression": "^1.7.4",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
