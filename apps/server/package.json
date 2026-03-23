@@ -17,7 +17,6 @@
     "dev": "node server.cjs",
     "start": "node server.cjs",
     "dev:router": "node llm-router.cjs",
-    "build": "echo 'Build skipped - web assets should be pre-built'",
     "test": "echo 'No tests specified for server'",
     "lint": "echo 'No linting configured for server'"
   },
