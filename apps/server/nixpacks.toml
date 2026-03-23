@@ -5,7 +5,7 @@ nixPkgs = ["nodejs_20"]
 cmds = ["npm install"]
 
 [phases.build]
-cmds = []
+cmds = ["echo 'no build step'"]
 
 [start]
 cmd = "node server.cjs"
