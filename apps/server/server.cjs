@@ -347,6 +347,9 @@ app.get('/api/system-prompt', (_req, res) => {
   }
 });
 
+// Health check for Railway (expects /health)
+app.get('/health', (_req, res) => res.send('OK'));
+
 // Proxy /api/llm/stats to the configured LLM router (Cerbère) or DEFAULT_UPSTREAM
 let __stats_cache = null;
 let __stats_cache_ts = 0;
