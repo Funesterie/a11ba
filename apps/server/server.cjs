@@ -837,7 +837,7 @@ app.get('/api/a11/memory/conversations', (req, res) => {
     res.status(500).json({ ok: false, error: String(e && e.message) });
   }
 });
-// --- Fin API mémoire ---
+/// --- Fin API mémoire ---
 
 // --- MEMO API: créer un mémo ---
 app.post('/api/a11/memo', express.json(), (req, res) => {
