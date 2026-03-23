@@ -614,7 +614,7 @@ const DEFAULT_UPSTREAM = globalThis.__A11_DEFAULT_UPSTREAM;
 // Expose configured backend and LLAMA_BASE for diagnostics.
 const LLAMA_BASE_ENV = process.env.LLAMA_BASE && process.env.LLAMA_BASE.trim();
 const RAW_BACKEND = String(process.env.BACKEND || '').trim().toLowerCase();
-const BACKEND = (LLAMA_BASE_ENV ? 'local' : (RAW_BACKEND || 'local'))
+const BACKEND = (LLAMA_BASE_ENV ? 'local' : (RAW_BACKEND || 'local'));
 if (LLAMA_BASE_ENV && RAW_BACKEND !== 'local') {
     console.log(`[Alpha Onze] Notice: LLAMA_BASE is set -> forcing BACKEND='local' (was '${RAW_BACKEND || 'unset'}').`);
 }
