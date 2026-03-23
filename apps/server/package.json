@@ -23,6 +23,7 @@
     "@funeste38/envaptex": "^1.0.0",
     "@funeste38/freeland": "^0.1.0",
     "@funeste38/nezlephant": "^0.1.0",
+    "@funeste38/qflush": "^4.0.6",
     "@funeste38/rome": "^1.5.3",
     "adm-zip": "^0.5.16",
     "axios": "^1.13.2",
