@@ -44,7 +44,7 @@ console.log('[NEZ ENV] NEZ_ALLOWED_TOKEN=', process.env.NEZ_ALLOWED_TOKEN);
 const CTX_SIZE = Number(process.env.CTX_SIZE) || 8192;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 4096;
 const PARALLEL = Number(process.env.PARALLEL) || 8;
-const HOST_BIND = process.env.HOST_SERVER || '127.0.0.1';
+const HOST_BIND = '0.0.0.0';
 
 // -------------------
 
@@ -614,7 +614,7 @@ const DEFAULT_UPSTREAM = globalThis.__A11_DEFAULT_UPSTREAM;
 // Expose configured backend and LLAMA_BASE for diagnostics.
 const LLAMA_BASE_ENV = process.env.LLAMA_BASE && process.env.LLAMA_BASE.trim();
 const RAW_BACKEND = String(process.env.BACKEND || '').trim().toLowerCase();
-const BACKEND = (LLAMA_BASE_ENV ? 'local' : (RAW_BACKEND || 'local'));
+const BACKEND = (LLAMA_BASE_ENV ? 'local' : (RAW_BACKEND || 'local'))
 if (LLAMA_BASE_ENV && RAW_BACKEND !== 'local') {
     console.log(`[Alpha Onze] Notice: LLAMA_BASE is set -> forcing BACKEND='local' (was '${RAW_BACKEND || 'unset'}').`);
 }
@@ -639,19 +639,6 @@ try {
 globalThis.power1 = power1;
 globalThis.power2 = power2;
 globalThis.power3 = power3;
-
-// Fallback: ensure server starts
-if (!LISTENING) {
-  try {
-    app.listen(PORT, HOST_BIND, () => {
-      LISTENING = true;
-      console.log(`[A11] Server listening on http://${HOST_BIND}:${PORT}`);
-    });
-  } catch (e) {
-    console.error('[A11] Failed to start server:', e && e.message);
-    process.exit(1);
-  }
-}
 
 // Ajout des routes pour le pont QFlush et l'agent A-11
 const { runQflushTool } = require("./lib/qflushTools");
@@ -983,9 +970,3 @@ app.use(a11HistoryRouter);
 // Ajout du routeur Cerbère (llm-router.cjs)
 const llmRouter = require('./llm-router.cjs');
 app.use(llmRouter);
-
-// Démarrage du serveur sur le port défini (une seule déclaration de PORT)
-// Utilise la variable PORT déjà définie plus haut (globalThis.__A11_PORT)
-app.listen(PORT, () => {
-  console.log(`[A11] Server listening on port ${PORT}`);
-});
