@@ -378,6 +378,12 @@ try {
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const JWT_EXPIRY = '24h';
 
+// ⚠️ SECURITY WARNING: si JWT_SECRET est le default, on log un warning en prod
+if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'dev-secret-change-in-production') {
+  console.error('[SECURITY] ⚠️⚠️⚠️ JWT_SECRET is set to DEFAULT - SET IT IN PRODUCTION! ⚠️⚠️⚠️');
+  console.error('[SECURITY] Si tu deploys sur Railway: ajoute JWT_SECRET dans les variables d\'env');
+}
+
 // ✅ JWT verification middleware
 function verifyJWT(req, res, next) {
   const token = req.headers['x-nez-token'] || req.headers.authorization?.replace('Bearer ', '');
@@ -665,7 +671,8 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl) {
     const nPredictRaw = body.n_predict ?? body.max_tokens ?? 200;
     const nPredict = Number.isFinite(Number(nPredictRaw)) ? Number(nPredictRaw) : 200;
 
-    console.log('[A11] Proxying local llama.cpp completion ->', localLlamaCompletionUrl);
+    const userInfo = req.user?.username ? `(user: ${req.user.username})` : '';
+    console.log('[A11][Llama] Proxying local completion', userInfo, '->', localLlamaCompletionUrl);
     const upstreamRes = await axios({
       method: 'post',
       url: localLlamaCompletionUrl,
