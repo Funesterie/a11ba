@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Include common user-local bin paths where pip installs executables.
+export PATH="/root/.local/bin:/app/.local/bin:${PATH}"
+
 echo "[A11] Booting server..."
 
 PIPER_PID=""
