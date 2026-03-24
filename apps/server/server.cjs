@@ -714,9 +714,32 @@ app.post('/v1/chat/completions', proxyChatToOpenAI);
 // Existing frontend route
 app.post('/api/llm/chat', proxyChatToOpenAI);
 
-// Compatibility aliases used by older frontend builds
-app.post('/api/ai', proxyChatToOpenAI);
-app.post('/api/completions', proxyChatToOpenAI);
+// Compatibility aliases used by older frontend builds — ensure provider defaults to 'local' if available
+app.post('/api/ai', express.json({ limit: '10mb' }), async (req, res) => {
+  try {
+    if (!req.body) req.body = {};
+    if (!req.body.provider && process.env.LOCAL_LLM_URL?.trim()) {
+      req.body.provider = 'local';
+    }
+    return proxyChatToOpenAI(req, res);
+  } catch (err) {
+    console.error('[A11][/api/ai] Error:', err?.message);
+    return res.status(502).json({ ok: false, error: 'proxy_error', message: String(err?.message) });
+  }
+});
+
+app.post('/api/completions', express.json({ limit: '10mb' }), async (req, res) => {
+  try {
+    if (!req.body) req.body = {};
+    if (!req.body.provider && process.env.LOCAL_LLM_URL?.trim()) {
+      req.body.provider = 'local';
+    }
+    return proxyChatToOpenAI(req, res);
+  } catch (err) {
+    console.error('[A11][/api/completions] Error:', err?.message);
+    return res.status(502).json({ ok: false, error: 'proxy_error', message: String(err?.message) });
+  }
+});
 
 // helper to collect stream into buffer
 function streamToBuffer(stream) {
