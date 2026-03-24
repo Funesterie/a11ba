@@ -77,6 +77,7 @@ const cors = require('cors');
 const compression = require('compression');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const axios = require('axios');
+const crypto = require('crypto');
 // OpenAI SDK (CommonJS)
 let OpenAI;
 try {
@@ -101,6 +102,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const { nezAuth, getNezAccessLog, TOKENS, MODE, registerIssuedToken } = require('./src/middleware/nezAuth');
 
 const BASE = path.resolve(__dirname);
@@ -358,16 +360,29 @@ const db = process.env.DATABASE_URL
 
 if (db) {
   db.connect()
-    .then(client => { client.release(); console.log('[DB] ✅ PostgreSQL connecté'); })
+    .then(async (client) => {
+      client.release();
+      console.log('[DB] ✅ PostgreSQL connecté');
+      try {
+        await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT');
+        await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at TIMESTAMP');
+        console.log('[DB] ✅ users.reset_token columns vérifiées');
+      } catch (schemaErr) {
+        console.warn('[DB] ⚠️ Migration reset token non appliquée:', schemaErr.message);
+      }
+    })
     .catch(e => console.error('[DB] ❌ Connexion PostgreSQL échouée:', e.message));
 } else {
   console.warn('[DB] DATABASE_URL non défini, authentification DB désactivée');
 }
 
 // ============================================================
-// Email transporter (nodemailer)
-// Priority: SMTP_* config, fallback Gmail service
+// Email providers
+// Priority: Resend API, then SMTP/Gmail fallback
 // ============================================================
+const resendApiKey = String(process.env.RESEND_API_KEY || '').trim();
+const resendClient = resendApiKey ? new Resend(resendApiKey) : null;
+
 const hasSmtpConfig = !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
 const hasGmailConfig = !!(process.env.EMAIL_USER && process.env.EMAIL_PASS);
 
@@ -385,12 +400,18 @@ const emailTransporter = hasSmtpConfig
       })
     : null;
 
-if (!emailTransporter) {
-  console.warn('[MAIL] EMAIL_USER/EMAIL_PASS ou SMTP_* manquants: forgot-password ne peut pas envoyer de mail');
+if (resendClient) {
+  console.log('[MAIL] ✅ Resend provider activé');
+}
+
+if (!resendClient && !emailTransporter) {
+  console.warn('[MAIL] Aucun provider mail configuré (RESEND_API_KEY ou SMTP_* ou EMAIL_*)');
 } else {
-  emailTransporter.verify()
-    .then(() => console.log('[MAIL] ✅ Transport email prêt'))
-    .catch((e) => console.error('[MAIL] ❌ Transport email invalide:', e.message));
+  if (emailTransporter) {
+    emailTransporter.verify()
+      .then(() => console.log('[MAIL] ✅ Transport SMTP prêt'))
+      .catch((e) => console.error('[MAIL] ❌ Transport SMTP invalide:', e.message));
+  }
 }
 
 // Ajout express.json AVANT les proxies pour garantir le body POST
@@ -524,7 +545,7 @@ const forgotPasswordHandler = async (req, res) => {
   const { email } = req.body || {};
   const normalizedEmail = String(email || '').trim().toLowerCase();
   if (!normalizedEmail) return res.status(400).json({ error: 'Missing email' });
-  if (!emailTransporter) {
+  if (!resendClient && !emailTransporter) {
     console.warn('[AUTH] Forgot requested but email transport is not configured');
     return res.json({ ok: true, mailEnabled: false });
   }
@@ -536,14 +557,33 @@ const forgotPasswordHandler = async (req, res) => {
       return res.json({ ok: true });
     }
     const user = rows[0];
-    const resetToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '15m' });
-    const link = `${process.env.FRONT_URL || 'https://a11.funesterie.pro'}/reset?token=${resetToken}`;
-    await emailTransporter.sendMail({
-      from: process.env.EMAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER,
-      to: user.email,
-      subject: 'A11 — Réinitialisation mot de passe',
-      text: `Clique ici pour réinitialiser ton mot de passe (valide 15 min):\n\n${link}`
-    });
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    await db.query(
+      'UPDATE users SET reset_token=$1, reset_token_expires_at=$2 WHERE id=$3',
+      [resetToken, expiresAt, user.id]
+    );
+
+    const appUrl = (process.env.APP_URL || process.env.FRONT_URL || 'https://a11.funesterie.pro').replace(/\/$/, '');
+    const link = `${appUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
+    const fromEmail = process.env.EMAIL_FROM || 'A11 <onboarding@resend.dev>';
+
+    if (resendClient) {
+      await resendClient.emails.send({
+        from: fromEmail,
+        to: user.email,
+        subject: 'A11 — Réinitialisation mot de passe',
+        html: `<p>Clique ici pour réinitialiser ton mot de passe (valide 15 min):</p><p><a href="${link}">${link}</a></p>`
+      });
+    } else {
+      await emailTransporter.sendMail({
+        from: process.env.EMAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER,
+        to: user.email,
+        subject: 'A11 — Réinitialisation mot de passe',
+        text: `Clique ici pour réinitialiser ton mot de passe (valide 15 min):\n\n${link}`
+      });
+    }
     console.log('[AUTH] ✅ Reset email envoyé à:', user.email);
     res.json({ ok: true, mailEnabled: true });
   } catch (e) {
@@ -561,10 +601,31 @@ const resetPasswordHandler = async (req, res) => {
   const { token, password } = req.body || {};
   if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
     const hash = await bcrypt.hash(password, 10);
-    await db.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, decoded.id]);
-    console.log('[AUTH] ✅ Password reset for user id:', decoded.id);
+
+    // New flow: DB token with expiration
+    const byResetToken = await db.query(
+      'SELECT id FROM users WHERE reset_token=$1 AND reset_token_expires_at > NOW() LIMIT 1',
+      [token]
+    );
+
+    if (byResetToken.rows.length) {
+      const userId = byResetToken.rows[0].id;
+      await db.query(
+        'UPDATE users SET password_hash=$1, reset_token=NULL, reset_token_expires_at=NULL WHERE id=$2',
+        [hash, userId]
+      );
+      console.log('[AUTH] ✅ Password reset via DB token for user id:', userId);
+      return res.json({ ok: true });
+    }
+
+    // Backward compatibility: previous JWT reset token format
+    const decoded = jwt.verify(token, JWT_SECRET);
+    await db.query(
+      'UPDATE users SET password_hash=$1, reset_token=NULL, reset_token_expires_at=NULL WHERE id=$2',
+      [hash, decoded.id]
+    );
+    console.log('[AUTH] ✅ Password reset via JWT token for user id:', decoded.id);
     res.json({ ok: true });
   } catch (e) {
     console.error('[AUTH] Reset error:', e.message);
