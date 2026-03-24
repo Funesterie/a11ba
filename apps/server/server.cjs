@@ -365,14 +365,33 @@ if (db) {
 }
 
 // ============================================================
-// Email transporter (nodemailer / Gmail)
+// Email transporter (nodemailer)
+// Priority: SMTP_* config, fallback Gmail service
 // ============================================================
-const emailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_PASS)
+const hasSmtpConfig = !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
+const hasGmailConfig = !!(process.env.EMAIL_USER && process.env.EMAIL_PASS);
+
+const emailTransporter = hasSmtpConfig
   ? nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT),
+      secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
     })
-  : null;
+  : hasGmailConfig
+    ? nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+      })
+    : null;
+
+if (!emailTransporter) {
+  console.warn('[MAIL] EMAIL_USER/EMAIL_PASS ou SMTP_* manquants: forgot-password ne peut pas envoyer de mail');
+} else {
+  emailTransporter.verify()
+    .then(() => console.log('[MAIL] ✅ Transport email prêt'))
+    .catch((e) => console.error('[MAIL] ❌ Transport email invalide:', e.message));
+}
 
 // Ajout express.json AVANT les proxies pour garantir le body POST
 app.use(express.json({ limit: '10mb' }));
@@ -460,8 +479,13 @@ app.post('/api/auth/register', express.json(), async (req, res) => {
 
 // ✅ LOGIN - renvoie un JWT signé
 app.post('/api/auth/login', express.json(), async (req, res) => {
-  const { email, password } = req.body || {};
-  console.log('[AUTH] Login attempt:', email);
+  const { email, username, password } = req.body || {};
+  const identifier = (email || username || '').trim();
+  console.log('[AUTH] Login attempt:', identifier || '(empty)');
+
+  if (!identifier || !password) {
+    return res.status(400).json({ success: false, error: 'Missing credentials' });
+  }
 
   // Fallback hardcodé si pas de DB (dev sans DATABASE_URL)
   if (!db) {
@@ -474,7 +498,10 @@ app.post('/api/auth/login', express.json(), async (req, res) => {
   }
 
   try {
-    const { rows } = await db.query('SELECT * FROM users WHERE email=$1', [email]);
+    const { rows } = await db.query(
+      'SELECT * FROM users WHERE LOWER(email)=LOWER($1) OR username=$1 LIMIT 1',
+      [identifier]
+    );
     if (!rows.length) return res.status(401).json({ success: false, error: 'Invalid credentials' });
     const user = rows[0];
     const ok = await bcrypt.compare(password, user.password_hash);
@@ -493,6 +520,10 @@ const forgotPasswordHandler = async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database unavailable' });
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
+  if (!emailTransporter) {
+    console.warn('[AUTH] Forgot requested but email transport is not configured');
+    return res.json({ ok: true, mailEnabled: false });
+  }
   try {
     const { rows } = await db.query('SELECT * FROM users WHERE email=$1', [email]);
     // Toujours répondre ok pour ne pas révéler si l'email existe
@@ -500,17 +531,14 @@ const forgotPasswordHandler = async (req, res) => {
     const user = rows[0];
     const resetToken = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '15m' });
     const link = `${process.env.FRONT_URL || 'https://a11.funesterie.pro'}/reset?token=${resetToken}`;
-    if (emailTransporter) {
-      await emailTransporter.sendMail({
-        to: email,
-        subject: 'A11 — Réinitialisation mot de passe',
-        text: `Clique ici pour réinitialiser ton mot de passe (valide 15 min):\n\n${link}`
-      });
-      console.log('[AUTH] ✅ Reset email envoyé à:', email);
-    } else {
-      console.warn('[AUTH] Reset link (no email configured):', link);
-    }
-    res.json({ ok: true });
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER,
+      to: email,
+      subject: 'A11 — Réinitialisation mot de passe',
+      text: `Clique ici pour réinitialiser ton mot de passe (valide 15 min):\n\n${link}`
+    });
+    console.log('[AUTH] ✅ Reset email envoyé à:', email);
+    res.json({ ok: true, mailEnabled: true });
   } catch (e) {
     console.error('[AUTH] Forgot error:', e.message);
     res.status(500).json({ error: 'Server error' });
