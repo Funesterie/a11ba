@@ -323,7 +323,17 @@ const corsOptions = {
     // Allow requests with no origin (e.g., curl, mobile clients)
     if (!origin) return callback(null, true);
     const incomingOrigin = normalizeOrigin(origin);
+    
+    // Check exact matches
     if (CORS_ORIGINS.includes(incomingOrigin)) return callback(null, true);
+    
+    // Allow Netlify preview deployments: https://xxxxx--a11funesterie.netlify.app
+    const netlifyPreviewPattern = /https:\/\/[a-z0-9-]*--a11funesterie\.netlify\.app$/i;
+    if (netlifyPreviewPattern.test(incomingOrigin)) {
+      console.log('[A11][CORS] ✅ allowed Netlify preview:', incomingOrigin);
+      return callback(null, true);
+    }
+    
     console.warn('[A11][CORS] origin denied:', incomingOrigin, 'allowed:', CORS_ORIGINS.join(','));
     return callback(new Error('CORS origin denied'));
   },
@@ -388,52 +398,27 @@ app.post('/api/auth/login', express.json(), (req, res) => {
 app.use('/api/ai', nezAuth);
 
 // ✅ PROTECTED CHAT ROUTE — /api/ai/chat (auth required via middleware)
-// Centralized proxy to Cerbère (LLM Router) with user context
+// Centralized proxy with user context.
+// If LOCAL_LLM_URL is set and provider is not explicit, default to provider=local
+// so the unified proxy can target llama.cpp /completion.
 app.post('/api/ai/chat', express.json({ limit: '10mb' }), async (req, res) => {
   try {
-    const cerbereUrl = (process.env.LLM_ROUTER_URL?.trim() || 'http://127.0.0.1:4545')
-      .replace(/\/$/, '') + '/v1/chat/completions';
-    
     // req.user is available from Nezlephant middleware
     const user = req.user?.id || 'anonymous';
     console.log(`[A11][AuthChat] User ${user} calling /api/ai/chat`);
-    
-    // Forward to Cerbère with optional user context
+
+    // Forward to the canonical proxy with optional user context.
     const body = {
       ...req.body,
       _user: user  // Pass user context to LLM router for potential routing
     };
-    
-    const upstreamRes = await fetch(cerbereUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body),
-      timeout: 60000
-    });
-    
-    // Copy headers from upstream response
-    const contentType = upstreamRes.headers.get('content-type') || 'application/json';
-    res.setHeader('Content-Type', contentType);
-    
-    // Stream or return response
-    if (upstreamRes.ok) {
-      // For SSE or streaming responses, pipe through
-      if (contentType.includes('text/event-stream') || contentType.includes('text/plain')) {
-        res.setHeader('Transfer-Encoding', 'chunked');
-        const buffer = await streamToBuffer(upstreamRes.body);
-        res.end(buffer);
-      } else {
-        // JSON response
-        const data = await upstreamRes.json();
-        res.status(upstreamRes.status).json(data);
-      }
-    } else {
-      // Error response
-      const errorData = await upstreamRes.json().catch(() => ({ error: 'Unknown error' }));
-      res.status(upstreamRes.status).json(errorData);
+
+    if (!body.provider && process.env.LOCAL_LLM_URL?.trim()) {
+      body.provider = 'local';
     }
+
+    req.body = body;
+    return proxyChatToOpenAI(req, res);
   } catch (err) {
     console.error('[A11][AuthChat] Proxy error:', err?.message);
     res.status(502).json({
@@ -570,6 +555,28 @@ function getLocalCompletionsUrl() {
   return normalized.endsWith('/v1') ? `${normalized}/chat/completions` : `${normalized}/v1/chat/completions`;
 }
 
+function getLocalLlamaCompletionUrl() {
+  const base = String(process.env.LOCAL_LLM_URL || '').trim();
+  if (!base) return null;
+  return `${base.replace(/\/$/, '')}/completion`;
+}
+
+function buildPromptFromMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+  return messages
+    .map((m) => (typeof m?.content === 'string' ? m.content : ''))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function extractLocalCompletionContent(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  if (typeof payload.content === 'string') return payload.content;
+  if (typeof payload.response === 'string') return payload.response;
+  if (Array.isArray(payload.choices) && payload.choices[0]?.text) return String(payload.choices[0].text);
+  return '';
+}
+
 function getCompletionsUrlForRequest(body) {
   const provider = String(body?.provider || '').trim().toLowerCase();
   if (provider === 'local') {
@@ -589,14 +596,91 @@ function buildOpenAIProxyHeaders(reqHeaders, options = {}) {
   return headers;
 }
 
+function appendChatTurnLogSafe(body, responsePayload, defaultModel) {
+  try {
+    const reqBody = body || {};
+    const convId = reqBody.conversationId || reqBody.convId || reqBody.sessionId || 'default';
+    const messages = Array.isArray(reqBody.messages) ? reqBody.messages : [];
+    appendConversationLog({
+      type: 'chat_turn',
+      conversationId: convId,
+      request: {
+        model: reqBody.model || defaultModel,
+        messages,
+      },
+      response: responsePayload,
+    });
+  } catch (e) {
+    console.warn('[A11][memory] log chat_turn failed:', e?.message);
+  }
+}
+
+async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl) {
+  try {
+    const body = req.body || {};
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const prompt = typeof body.prompt === 'string' && body.prompt.trim()
+      ? body.prompt
+      : buildPromptFromMessages(messages);
+    const nPredictRaw = body.n_predict ?? body.max_tokens ?? 200;
+    const nPredict = Number.isFinite(Number(nPredictRaw)) ? Number(nPredictRaw) : 200;
+
+    console.log('[A11] Proxying local llama.cpp completion ->', localLlamaCompletionUrl);
+    const upstreamRes = await axios({
+      method: 'post',
+      url: localLlamaCompletionUrl,
+      headers: { 'content-type': 'application/json' },
+      data: {
+        prompt,
+        n_predict: nPredict,
+        stream: false
+      },
+      timeout: 60000,
+    });
+
+    const content = extractLocalCompletionContent(upstreamRes.data);
+    const data = {
+      id: `chatcmpl-local-${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: body.model || 'local-gguf',
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content,
+          },
+          finish_reason: 'stop',
+        },
+      ],
+    };
+
+    appendChatTurnLogSafe(body, data, 'local-gguf');
+    return res.status(200).json(data);
+  } catch (err) {
+    console.error('[A11] Error proxying local llama.cpp completion ->', localLlamaCompletionUrl, err && (err.message || err.toString()));
+    if (err.response?.data) {
+      return res.status(err.response.status || 502).json(err.response.data);
+    }
+    return res.status(502).json({ ok: false, error: 'upstream_unreachable', message: String(err?.message) });
+  }
+}
+
 async function proxyChatToOpenAI(req, res) {
   const provider = String(req.body?.provider || '').trim().toLowerCase();
+  const localLlamaCompletionUrl = provider === 'local' ? getLocalLlamaCompletionUrl() : null;
+
+  if (localLlamaCompletionUrl) {
+    return proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl);
+  }
+
   const upstreamUrl = getCompletionsUrlForRequest(req.body);
   if (!upstreamUrl) {
     return res.status(500).json({
       ok: false,
       error: 'missing_local_upstream',
-      message: 'provider=local requires QFLUSH_URL (or QFLUSH_REMOTE_URL / LLAMA_BASE)'
+      message: 'provider=local requires LOCAL_LLM_URL (or QFLUSH_URL / QFLUSH_REMOTE_URL / LLAMA_BASE)'
     });
   }
   console.log('[A11] Proxying chat ->', upstreamUrl, `(provider=${provider || 'openai'})`);
@@ -612,22 +696,7 @@ async function proxyChatToOpenAI(req, res) {
 
     const data = upstreamRes.data;
 
-    try {
-      const body = req.body || {};
-      const convId = body.conversationId || body.convId || body.sessionId || 'default';
-      const messages = Array.isArray(body.messages) ? body.messages : [];
-      appendConversationLog({
-        type: 'chat_turn',
-        conversationId: convId,
-        request: {
-          model: body.model || 'gpt-4o-mini',
-          messages
-        },
-        response: data
-      });
-    } catch (e) {
-      console.warn('[A11][memory] log chat_turn failed:', e?.message);
-    }
+    appendChatTurnLogSafe(req.body, data, 'gpt-4o-mini');
 
     return res.status(upstreamRes.status).json(data);
   } catch (err) {
