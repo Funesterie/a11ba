@@ -2239,8 +2239,18 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
   };
 }
 
-function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext) {
+function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext, systemPrompt) {
+  const messages = [];
+  const normalizedSystemPrompt = String(systemPrompt || '').trim();
   const systemMemoryParts = [];
+
+  if (normalizedSystemPrompt) {
+    messages.push({
+      role: 'system',
+      content: normalizedSystemPrompt
+    });
+  }
+
   if (logicalMemory) {
     systemMemoryParts.push(`Contexte utilisateur (memoire logique):\n${logicalMemory}`);
   }
@@ -2248,15 +2258,15 @@ function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structured
     systemMemoryParts.push(structuredMemoryContext);
   }
 
-  if (!systemMemoryParts.length) {
-    return Array.isArray(storedMessages) ? storedMessages : [];
+  if (systemMemoryParts.length) {
+    messages.push({
+      role: 'system',
+      content: systemMemoryParts.join('\n\n')
+    });
   }
 
   return [
-    {
-      role: 'system',
-      content: systemMemoryParts.join('\n\n')
-    },
+    ...messages,
     ...(Array.isArray(storedMessages) ? storedMessages : [])
   ];
 }
@@ -2288,7 +2298,12 @@ async function proxyQflushChat(req, res) {
     } = memoryContext;
 
     const prompt = latestUserMessage || buildPromptFromMessages(storedMessages);
-    const qflushMessages = buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext);
+    const qflushMessages = buildQflushMessagesWithMemory(
+      storedMessages,
+      logicalMemory,
+      structuredMemoryContext,
+      body.systemPrompt
+    );
 
     console.log('[A11] USING QFLUSH flow ->', qflushChatFlow);
     const qflushResult = await runQflushFlow(qflushChatFlow, {
