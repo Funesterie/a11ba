@@ -1,9 +1,11 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "python311"]
+nixPkgs = ["nodejs_20", "python311Full"]
 
 [phases.install]
 cmds = [
 	"npm install",
+	"python3 -m ensurepip --upgrade || true",
+	"python3 -m pip --version",
 	"python3 -m pip install --no-cache-dir piper-tts"
 ]
 
