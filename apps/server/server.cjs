@@ -489,7 +489,7 @@ app.post('/api/auth/login', express.json(), async (req, res) => {
 });
 
 // ✅ FORGOT PASSWORD
-app.post('/api/auth/forgot', express.json(), async (req, res) => {
+const forgotPasswordHandler = async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database unavailable' });
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
@@ -515,10 +515,13 @@ app.post('/api/auth/forgot', express.json(), async (req, res) => {
     console.error('[AUTH] Forgot error:', e.message);
     res.status(500).json({ error: 'Server error' });
   }
-});
+};
+
+app.post('/api/auth/forgot', express.json(), forgotPasswordHandler);
+app.post('/api/auth/forgot-password', express.json(), forgotPasswordHandler);
 
 // ✅ RESET PASSWORD
-app.post('/api/auth/reset', express.json(), async (req, res) => {
+const resetPasswordHandler = async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database unavailable' });
   const { token, password } = req.body || {};
   if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
@@ -532,7 +535,10 @@ app.post('/api/auth/reset', express.json(), async (req, res) => {
     console.error('[AUTH] Reset error:', e.message);
     res.status(400).json({ error: 'Invalid or expired token' });
   }
-});
+};
+
+app.post('/api/auth/reset', express.json(), resetPasswordHandler);
+app.post('/api/auth/reset-password', express.json(), resetPasswordHandler);
 
 // ✅ AUTH MIDDLEWARE - appliqué SEULEMENT sur /api/ai pour protéger chat
 // /api/auth/login reste public!
