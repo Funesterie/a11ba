@@ -378,10 +378,21 @@ function spawnPiperLocal(text, model) {
         '--output_file', outFile
       ];
 
+      let stderr = '';
+      let stdout = '';
+
       const p = spawn(piper.command, args, {
         cwd: piper.cwd,
-        stdio: ['pipe', 'ignore', 'inherit'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true
+      });
+
+      p.stdout.on('data', (chunk) => {
+        stdout += String(chunk || '');
+      });
+
+      p.stderr.on('data', (chunk) => {
+        stderr += String(chunk || '');
       });
 
       p.stdin.write(text);
@@ -396,15 +407,17 @@ function spawnPiperLocal(text, model) {
           if (fs.existsSync(outFile)) {
             return resolve({ success: true, audioUrl: `/tts/${outFileName}` });
           }
-          return reject(new Error('tts_failed_no_file'));
+          return reject(new Error(`tts_failed_no_file${stderr ? ': ' + stderr.trim().slice(0, 500) : ''}`));
         }
-        return reject(new Error('tts_failed_exit_' + code));
+        const details = stderr.trim() || stdout.trim();
+        return reject(new Error(`tts_failed_exit_${code}${details ? ': ' + details.slice(0, 500) : ''}`));
       });
 
       p.on('error', (err) => {
         if (responded) return;
         responded = true;
-        return reject(new Error('tts_spawn_error: ' + String(err?.message)));
+        const details = stderr.trim() || stdout.trim();
+        return reject(new Error(`tts_spawn_error: ${String(err?.message)}${details ? ' :: ' + details.slice(0, 500) : ''}`));
       });
 
     } catch (err) {
