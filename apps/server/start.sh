@@ -32,7 +32,7 @@ if [ "${ENABLE_PIPER_HTTP:-false}" = "true" ]; then
 	export PIPER_HTTP_PORT="${TTS_PORT:-5002}"
 	mkdir -p "${TTS_OUT_DIR}"
 	echo "[A11] Starting Piper HTTP server (serve.py) on port ${PIPER_HTTP_PORT}"
-	echo "[A11]   Model  : ${TTS_MODEL_PATH:-/app/apps/tts/fr_FR-siwis-medium.onnx}"
+	echo "[A11]   Model  : ${TTS_MODEL_PATH:-/app/apps/server/tts/fr_FR-siwis-medium.onnx}"
 	echo "[A11]   OutDir : ${TTS_OUT_DIR}"
 	python3 /app/apps/tts/serve.py &
 	PIPER_PID=$!

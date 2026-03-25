@@ -117,9 +117,11 @@ function resolvePiperModel(requestedModel) {
 
   const baseDirs = [
     modelsDirEnv,
+    path.join(workspaceRoot, 'apps', 'server', 'tts'),
     path.join(workspaceRoot, 'apps', 'tts'),
     path.join(workspaceRoot, 'piper', 'models'),
     path.join(workspaceRoot, 'tts'),
+    '/app/apps/server/tts',
     '/app/apps/tts',
     '/app/tts',
     '/data/tts'
@@ -460,7 +462,7 @@ router.get('/tts/health', async (req, res) => {
 router.get('/tts/models', (req, res) => {
   try {
     const configuredDir = String(process.env.TTS_MODELS_DIR || process.env.PIPER_MODELS_DIR || '').trim();
-    const modelsDir = configuredDir || path.join(getWorkspaceRoot(), 'piper', 'models');
+    const modelsDir = configuredDir || path.join(getWorkspaceRoot(), 'apps', 'server', 'tts');
     if (!fs.existsSync(modelsDir)) return res.json({ models: [] });
     const models = listOnnxFiles(modelsDir);
     return res.json({ models, modelsDir });
