@@ -50,6 +50,12 @@ function emitEvent(name: string) {
   }
 }
 
+function emitCustomEvent(name: string, detail: Record<string, unknown>) {
+  if (typeof (globalThis as any)?.dispatchEvent === 'function') {
+    (globalThis as any).dispatchEvent(new CustomEvent(name, { detail }));
+  }
+}
+
 function getApiOrigin(): string {
   const currentOrigin = (globalThis as any)?.location?.origin || 'http://localhost';
   if (!API_BASE) return currentOrigin;
@@ -212,6 +218,7 @@ async function fetchAndPlayPiperTTS(text: string, options: any = {}, onEnd?: () 
     const playPromise = audio.play();
     playPromise.catch((error) => {
       console.error('[speech] audio.play() failed', error);
+      emitCustomEvent('a11:audioBlocked', { url: audio.src });
       emitEvent('a11:speechend');
       options.onError?.(new Error(`Audio playback blocked: ${String(error?.message || error)}`));
       onEnd?.();
@@ -223,6 +230,31 @@ async function fetchAndPlayPiperTTS(text: string, options: any = {}, onEnd?: () 
     onEnd?.();
     if (currentAudio) currentAudio = null;
   }
+}
+
+/**
+ * Rejoue une URL audio directement (appelé après interaction utilisateur).
+ * Utile pour le fallback bouton play quand l'autoplay est bloqué.
+ */
+export function retryPlayUrl(url: string): void {
+  _audioUnlocked = true;
+  stopCurrentAudio();
+  const audio = new Audio(url);
+  currentAudio = audio;
+  audio.onended = () => {
+    emitEvent('a11:speechend');
+    if (currentAudio === audio) currentAudio = null;
+  };
+  audio.onerror = () => {
+    emitEvent('a11:speechend');
+    if (currentAudio === audio) currentAudio = null;
+  };
+  emitEvent('a11:speechstart');
+  audio.play().catch((e) => {
+    console.error('[speech] retryPlayUrl failed', e);
+    emitEvent('a11:speechend');
+    if (currentAudio === audio) currentAudio = null;
+  });
 }
 
 // --- Reconnaissance vocale (Web Speech API) ---

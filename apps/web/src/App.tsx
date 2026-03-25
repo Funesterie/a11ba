@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, useMemo } from "react";
-import { fetchA11HistoryList, fetchA11Conversation, login, logout, getAuthToken, forgotPassword, resetPassword } from "./lib/api";
+import { fetchA11HistoryList, fetchA11Conversation, login, logout, getAuthToken, forgotPassword, resetPassword, purgeMemoryNow } from "./lib/api";
 import { A11HistoryPanel } from "./components/A11HistoryPanel";
 import ReactMarkdown from "react-markdown";
 import "./index.css";
@@ -11,6 +11,7 @@ import {
   cancelSpeech,
   setSpeechMuted,
   isSpeechMuted,
+  retryPlayUrl,
 } from "./lib/speech";
 import handleImportFiles from "./lib/importer";
 import { chatCompletion, type Provider } from "./lib/api";
@@ -24,6 +25,12 @@ interface ChatMessage {
   imageUrl?: string | null;
 }
 
+interface PurgeHistoryEntry {
+  at: string;
+  dryRun: boolean;
+  removed: { facts: number; tasks: number; files: number };
+}
+
 interface LlmStats {
   ok: boolean;
   backend?: string;
@@ -33,11 +40,11 @@ interface LlmStats {
 }
 
 const DEFAULT_SYSTEM_NINDO =
-  "Tu es A-11, assistant local NOSSEN. Reste concis, orienté action, et utilise les capacités locales (VSIX, Qflush, Cerbère) quand c’est pertinent.";
+  "Tu es A-11, assistant local. Réponds de façon concise, claire et directe. N'invente pas de contexte. Ne fais aucune action et ne proposes aucune action non demandée explicitement. Si la question est triviale, réponds en une phrase maximum.";
 // ✅ LOGIN PANEL
 function LoginPanel({ onLoginSuccess }: readonly { onLoginSuccess: () => void }) {
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("1234");
+  const [username, setUsername] = useState("Djeff");
+  const [password, setPassword] = useState("1991");
   const [forgotEmail, setForgotEmail] = useState("");
   const [forgotSent, setForgotSent] = useState(false);
   const [error, setError] = useState("");
@@ -142,7 +149,7 @@ function LoginPanel({ onLoginSuccess }: readonly { onLoginSuccess: () => void })
         {forgotError && <div style={{ color: "red", fontSize: "13px" }}>{forgotError}</div>}
         {forgotSent && <div style={{ color: "#22c55e", fontSize: "13px" }}>Si l'email existe, un lien a ete envoye.</div>}
       </form>
-      <p style={{ fontSize: "12px", color: "#999" }}>Demo: admin / 1234</p>
+      <p style={{ fontSize: "12px", color: "#999" }}>Admin: Djeff / 1991</p>
     </div>
   );
 }
@@ -287,6 +294,22 @@ export function App() {
     },
   ]);
   const [ttsFallback, setTtsFallback] = useState(false);
+  const [audioBlockedUrl, setAudioBlockedUrl] = useState<string | null>(null);
+
+  // Audio-blocked banner: listen for autoplay block events
+  useEffect(() => {
+    const onBlocked = (e: Event) => {
+      const url = (e as CustomEvent).detail?.url;
+      if (url) setAudioBlockedUrl(url);
+    };
+    const onSpeechStart = () => setAudioBlockedUrl(null);
+    globalThis.addEventListener('a11:audioBlocked', onBlocked);
+    globalThis.addEventListener('a11:speechstart', onSpeechStart);
+    return () => {
+      globalThis.removeEventListener('a11:audioBlocked', onBlocked);
+      globalThis.removeEventListener('a11:speechstart', onSpeechStart);
+    };
+  }, []);
 
   // Check if already authenticated on mount
   useEffect(() => {
@@ -322,6 +345,11 @@ export function App() {
   const [a11ConvId, setA11ConvId] = useState<string | null>(null);
   const [a11ConvMsgs, setA11ConvMsgs] = useState<any[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [activeView, setActiveView] = useState<'chat' | 'admin'>('chat');
+  const [purgingMemory, setPurgingMemory] = useState(false);
+  const [purgeFeedback, setPurgeFeedback] = useState<string>("");
+  const [memoryPurgeDryRun, setMemoryPurgeDryRun] = useState(true);
+  const [purgeHistory, setPurgeHistory] = useState<PurgeHistoryEntry[]>([]);
 
   // load chats from localStorage on mount
   useEffect(() => {
@@ -332,11 +360,29 @@ export function App() {
         if (Array.isArray(parsed) && parsed.length) {
           // sanitize chats and messages to conform to expected types
           const sanitizeRole = (r: any) => (r === 'user' || r === 'assistant' || r === 'system') ? r as Role : 'assistant' as Role;
+          const normalizeSystemContent = (content: string) => {
+            const value = String(content || '');
+            if (
+              value.includes('utilise les capacités locales') ||
+              value.includes('assistant local NOSSEN')
+            ) {
+              return DEFAULT_SYSTEM_NINDO;
+            }
+            return value;
+          };
           const sanitized = parsed.map((c: any) => ({
             id: String(c.id || `chat-${Date.now()}`),
             name: String(c.name || 'Conversation'),
             updated: Number(c.updated) || Date.now(),
-            messages: Array.isArray(c.messages) ? c.messages.map((m: any) => ({ id: String(m.id || (`m-${Date.now()}`)), role: sanitizeRole(m.role), content: String(m.content || '') })) : [{ id: `sys-${Date.now()}`, role: 'system' as Role, content: DEFAULT_SYSTEM_NINDO }]
+            messages: Array.isArray(c.messages) ? c.messages.map((m: any) => {
+              const role = sanitizeRole(m.role);
+              const rawContent = String(m.content || '');
+              return {
+                id: String(m.id || (`m-${Date.now()}`)),
+                role,
+                content: role === 'system' ? normalizeSystemContent(rawContent) : rawContent
+              };
+            }) : [{ id: `sys-${Date.now()}`, role: 'system' as Role, content: DEFAULT_SYSTEM_NINDO }]
           }));
           setChats(sanitized);
           setSelectedChatId(sanitized[0].id);
@@ -362,6 +408,31 @@ export function App() {
     setSelectedChatId(initial[0].id);
     setMessages(initial[0].messages);
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('a11:memory-purge-history');
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        setPurgeHistory(
+          parsed
+            .filter((item: any) => item && typeof item.at === 'string')
+            .slice(0, 10)
+        );
+      }
+    } catch {
+      // ignore corrupted local history
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('a11:memory-purge-history', JSON.stringify(purgeHistory.slice(0, 10)));
+    } catch {
+      // ignore storage failures
+    }
+  }, [purgeHistory]);
 
   // persist chats whenever changed
   useEffect(() => {
@@ -601,7 +672,7 @@ export function App() {
     }
     // Règle anti-blabla
     parts.push(
-      `# RÈGLES\n- Tu réponds de façon simple, concrète, sans faire de roman.\n- Si la demande n'est pas claire, tu demandes une précision.\n- Tu ne proposes pas de modifier des fichiers tant que l'utilisateur ne le demande pas.`
+      `# RÈGLES\n- Réponds uniquement à la demande de l'utilisateur.\n- N'invente jamais de contexte ou de scénario.\n- Ne propose aucune action non demandée explicitement.\n- Si la demande n'est pas claire, pose une seule question de clarification.\n- Si la question est triviale, réponds en une phrase maximum.`
     );
     return parts.join("\n\n---\n\n");
   }, [nindoLayers]);
@@ -702,6 +773,40 @@ RÈGLES STRICTES :
       setA11ConvMsgs([]);
     } finally {
       setLoadingHistory(false);
+    }
+  }
+
+  async function handlePurgeMemoryNow() {
+    const confirmed = globalThis.confirm('Déclencher un purge-now de la mémoire structurée ?');
+    if (!confirmed || purgingMemory) return;
+
+    setPurgingMemory(true);
+    setPurgeFeedback('Purge en cours...');
+    try {
+      const result = await purgeMemoryNow({ dryRun: memoryPurgeDryRun });
+      const effectiveRemoved = result.dryRun ? (result.wouldRemove || { facts: 0, tasks: 0, files: 0 }) : result.removed;
+      const removedTotal = effectiveRemoved.facts + effectiveRemoved.tasks + effectiveRemoved.files;
+      setPurgeFeedback(
+        result.dryRun
+          ? `Dry run OK (${removedTotal} candidats) • facts ${effectiveRemoved.facts}, tasks ${effectiveRemoved.tasks}, files ${effectiveRemoved.files}`
+          : `Purge OK (${removedTotal} supprimés) • facts ${result.before.facts}->${result.after.facts}, tasks ${result.before.tasks}->${result.after.tasks}, files ${result.before.files}->${result.after.files}`
+      );
+      setPurgeHistory((prev) => [
+        {
+          at: result.purgeTriggeredAt,
+          dryRun: !!result.dryRun,
+          removed: {
+            facts: effectiveRemoved.facts,
+            tasks: effectiveRemoved.tasks,
+            files: effectiveRemoved.files,
+          },
+        },
+        ...prev,
+      ].slice(0, 10));
+    } catch (err) {
+      setPurgeFeedback(`Echec purge: ${(err as Error).message || String(err)}`);
+    } finally {
+      setPurgingMemory(false);
     }
   }
 
@@ -892,6 +997,7 @@ RÈGLES STRICTES :
                   <button
                     type="button"
                     onClick={() => {
+                      setActiveView('chat');
                       setSelectedChatId(chat.id);
                       setMessages(chat.messages);
                       setA11ConvId(null);
@@ -930,9 +1036,112 @@ RÈGLES STRICTES :
               />
             )}
           </div>
+          <div style={{ borderTop: '1px solid #22293a', padding: '8px 12px' }}>
+            <div className="text-xs uppercase tracking-wide text-slate-400" style={{ marginBottom: 8 }}>
+              Administration
+            </div>
+            <button
+              type="button"
+              onClick={() => setActiveView('admin')}
+              className="btn ghost"
+              style={{ width: '100%', justifyContent: 'flex-start', border: activeView === 'admin' ? '1px solid #334155' : undefined }}
+            >
+              Memory Controls
+            </button>
+          </div>
         </aside>
         {/* ...main... */}
         <main className="main" style={{ flex: 1, minWidth: 0 }}>
+          {activeView === 'admin' ? (
+            <div style={{ padding: 20, maxWidth: 760 }}>
+              <h2 style={{ marginTop: 0, color: '#e2e8f0' }}>Administration mémoire</h2>
+              <p style={{ color: '#94a3b8', marginTop: 4 }}>
+                Contrôle dédié pour lancer la purge de la mémoire structurée.
+              </p>
+
+              <div style={{
+                marginTop: 16,
+                padding: 14,
+                border: '1px solid #1f2937',
+                borderRadius: 10,
+                background: '#0b1220',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                flexWrap: 'wrap',
+              }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#cbd5e1', fontSize: 13 }}>
+                  <input
+                    type="checkbox"
+                    checked={memoryPurgeDryRun}
+                    onChange={(e) => setMemoryPurgeDryRun(e.target.checked)}
+                    disabled={purgingMemory}
+                  />
+                  Dry run (simulation sans suppression)
+                </label>
+                <button
+                  type="button"
+                  onClick={handlePurgeMemoryNow}
+                  disabled={purgingMemory}
+                  style={{
+                    padding: '8px 12px',
+                    borderRadius: 6,
+                    border: '1px solid #f59e0b',
+                    background: purgingMemory ? '#3f2a08' : 'transparent',
+                    color: '#fcd34d',
+                    cursor: purgingMemory ? 'not-allowed' : 'pointer',
+                    fontWeight: 700,
+                    fontSize: 12,
+                  }}
+                >
+                  {purgingMemory ? 'Execution...' : 'Lancer purge maintenant'}
+                </button>
+              </div>
+
+              {purgeFeedback && (
+                <div style={{
+                  marginTop: 14,
+                  padding: 10,
+                  borderRadius: 8,
+                  border: `1px solid ${purgeFeedback.startsWith('Echec') ? '#7f1d1d' : '#1e3a8a'}`,
+                  background: purgeFeedback.startsWith('Echec') ? '#2a0f0f' : '#0f172a',
+                  color: purgeFeedback.startsWith('Echec') ? '#fecaca' : '#bfdbfe',
+                  fontSize: 12,
+                }}>
+                  {purgeFeedback}
+                </div>
+              )}
+
+              <div style={{ marginTop: 18 }}>
+                <h3 style={{ margin: 0, color: '#e2e8f0', fontSize: 16 }}>Historique local</h3>
+                {purgeHistory.length === 0 ? (
+                  <div style={{ marginTop: 8, color: '#94a3b8', fontSize: 13 }}>Aucune purge locale pour le moment.</div>
+                ) : (
+                  <div style={{ marginTop: 8, border: '1px solid #1f2937', borderRadius: 8, overflow: 'hidden' }}>
+                    {purgeHistory.map((entry, index) => (
+                      <div
+                        key={`${entry.at}-${index}`}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          gap: 10,
+                          padding: '10px 12px',
+                          borderTop: index === 0 ? 'none' : '1px solid #1f2937',
+                          background: index % 2 === 0 ? '#0b1220' : '#0a101a',
+                          color: '#cbd5e1',
+                          fontSize: 12,
+                        }}
+                      >
+                        <span>{new Date(entry.at).toLocaleString()}</span>
+                        <span>{entry.dryRun ? 'dryRun' : 'purge'}</span>
+                        <span>facts {entry.removed.facts} | tasks {entry.removed.tasks} | files {entry.removed.files}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
           <div className="scroll-frame">
             <div className="log">
               {(a11ConvMsgs.length ? a11ConvMsgs : messages).map((m, idx) => {
@@ -1020,12 +1229,40 @@ RÈGLES STRICTES :
               onChange={onFileChange}
             />
           </div>
+          )}
         </main>
       </div>
       <footer className="footer">
         A-11 / Qflush UI · Cerbère 4545 · LLaMA local · Funesterie
       </footer>
       {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} />}
+      {audioBlockedUrl && (
+        <div style={{
+          position: 'fixed', bottom: 80, left: '50%', transform: 'translateX(-50%)',
+          background: '#1e293b', border: '1px solid #334155', borderRadius: 12,
+          padding: '10px 18px', display: 'flex', alignItems: 'center', gap: 10,
+          boxShadow: '0 4px 24px rgba(0,0,0,0.6)', zIndex: 9999,
+          color: '#e2e8f0', fontSize: 14, whiteSpace: 'nowrap',
+        }}>
+          <span>🔇 Audio bloqué</span>
+          <button
+            type="button"
+            onClick={() => { retryPlayUrl(audioBlockedUrl); setAudioBlockedUrl(null); }}
+            style={{
+              background: '#3b82f6', color: '#fff', border: 'none', borderRadius: 8,
+              padding: '6px 14px', cursor: 'pointer', fontSize: 13, fontWeight: 600,
+            }}
+          >
+            ▶ Jouer
+          </button>
+          <button
+            type="button"
+            onClick={() => setAudioBlockedUrl(null)}
+            style={{ background: 'none', color: '#94a3b8', border: 'none', cursor: 'pointer', fontSize: 18, lineHeight: 1, padding: '0 2px' }}
+            title="Ignorer"
+          >×</button>
+        </div>
+      )}
     </div>
   );
 }
