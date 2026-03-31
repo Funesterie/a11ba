@@ -12,43 +12,315 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+function sanitizeUtf8Text(value) {
+  return String(value ?? '')
+    .replace(/\u0000/g, '')
+    .replace(/\u2028|\u2029/g, '\n')
+    .replace(/[\u0001-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ');
+}
+
+function sanitizeChatMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .map((message) => {
+      const role = String(message?.role || '').trim().toLowerCase();
+      const content = typeof message?.content === 'string'
+        ? sanitizeUtf8Text(message.content).trim()
+        : '';
+      if (!content) return null;
+      return { ...message, role, content };
+    })
+    .filter((message) => message && (message.role === 'system' || message.role === 'assistant' || message.role === 'user'));
+}
+
 const PORT = process.env.LLM_ROUTER_PORT || process.env.PORT || 4545;
 const DEV_MODE = String(process.env.DEV_MODE || '').toLowerCase() === 'true';
 
 // Backend configuration
-const QFLUSH_BASE = process.env.QFLUSH_URL || process.env.QFLUSH_REMOTE_URL || null;
-const LLAMA_LOCAL_FALLBACK = process.env.NODE_ENV === 'production' ? null : "http://127.0.0.1:8000";
+const LOCAL_LLM_PORT = process.env.LLAMA_PORT || process.env.LOCAL_LLM_PORT || 8080;
+const LLAMA_LOCAL_FALLBACK = process.env.NODE_ENV === 'production'
+  ? null
+  : `http://127.0.0.1:${LOCAL_LLM_PORT}`;
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
+const OLLAMA_BASE = String(process.env.OLLAMA_BASE || 'http://127.0.0.1:11434').trim();
+const PRIMARY_BACKEND_KEY = 'llama_server';
+const CIRCUIT_BREAKER_THRESHOLD = Number(process.env.CERBERE_CIRCUIT_BREAKER_THRESHOLD || 3);
+const CIRCUIT_BREAKER_WINDOW_MS = Number(process.env.CERBERE_CIRCUIT_BREAKER_WINDOW_MS || 90_000);
+const CIRCUIT_BREAKER_COOLDOWN_MS = Number(process.env.CERBERE_CIRCUIT_BREAKER_COOLDOWN_MS || 60_000);
+const BACKEND_PROBE_INTERVAL_MS = Number(process.env.CERBERE_BACKEND_PROBE_INTERVAL_MS || 30_000);
+const BACKEND_HEALTH_CACHE_MS = Number(process.env.CERBERE_BACKEND_HEALTH_CACHE_MS || 8_000);
+
+const BACKEND_REGISTRY = {
+  llama_server: {
+    key: 'llama_server',
+    label: 'llama-server',
+    baseUrl: String(process.env.LOCAL_LLM_URL || process.env.LLAMA_BASE || LLAMA_LOCAL_FALLBACK || '').trim() || null,
+    chatPath: '/v1/chat/completions',
+    healthPath: '/health',
+  },
+  ollama: {
+    key: 'ollama',
+    label: 'ollama',
+    baseUrl: OLLAMA_BASE || null,
+    chatPath: '/v1/chat/completions',
+    healthPath: '/api/tags',
+  },
+  openai: {
+    key: 'openai',
+    label: 'openai',
+    baseUrl: String(process.env.OPENAI_API_URL || process.env.OPENAI_BASE_URL || '').trim() || null,
+    chatPath: '/chat/completions',
+    healthPath: '/models',
+    apiKey: OPENAI_API_KEY,
+  },
+};
 
 const BACKENDS = {
-  llama_local: process.env.LLAMA_BASE || QFLUSH_BASE || LLAMA_LOCAL_FALLBACK,
-  ollama: "http://127.0.0.1:11434",
-  openai: process.env.OPENAI_API_URL || null
+  llama_local: BACKEND_REGISTRY.llama_server.baseUrl,
+  ollama: BACKEND_REGISTRY.ollama.baseUrl,
+  openai: BACKEND_REGISTRY.openai.baseUrl,
+};
+
+const routerState = {
+  primaryBackend: BACKEND_REGISTRY[PRIMARY_BACKEND_KEY]?.label || 'llama-server',
+  activeBackend: BACKEND_REGISTRY[PRIMARY_BACKEND_KEY]?.label || 'llama-server',
+  lastSuccessfulBackend: null,
+  lastPrimaryError: null,
+  lastPrimaryFailureAt: null,
+  lastFailoverAt: null,
+  failoverHistory: [],
+  backendState: Object.fromEntries(Object.keys(BACKEND_REGISTRY).map((key) => [key, {
+    healthy: null,
+    lastCheckedAt: null,
+    lastSuccessAt: null,
+    lastFailureAt: null,
+    lastError: null,
+    circuitOpenUntil: null,
+    failureTimestamps: [],
+  }])),
 };
 
 console.log(`[Cerbère] DEV ENGINE initialized (DEV_MODE=${DEV_MODE ? 'true' : 'false'})`);
 console.log('[Cerbère] Available backends:', BACKENDS);
+console.log('[Cerbère] Local LLM fallback:', LLAMA_LOCAL_FALLBACK || '(disabled)');
 
-// Backend selection based on model
-function selectBackend(model) {
-  if (!model) return BACKENDS.llama_local || BACKENDS.openai || BACKENDS.ollama;
-  
-  const modelLower = String(model).toLowerCase();
-  
-  // OpenAI models
+function isoNow() {
+  return new Date().toISOString();
+}
+
+function joinBackendUrl(baseUrl, routePath) {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const suffix = String(routePath || '').startsWith('/') ? String(routePath || '') : `/${String(routePath || '')}`;
+  return `${base}${suffix}`;
+}
+
+function getBackendDefinition(key) {
+  return BACKEND_REGISTRY[String(key || '').trim()] || null;
+}
+
+function getBackendHeaders(key) {
+  const backend = getBackendDefinition(key);
+  const headers = {
+    'Content-Type': 'application/json',
+  };
+  if (backend?.key === 'openai' && backend.apiKey) {
+    headers.Authorization = `Bearer ${backend.apiKey}`;
+  }
+  return headers;
+}
+
+function pruneRecentFailures(key, now = Date.now()) {
+  const state = routerState.backendState[key];
+  if (!state) return [];
+  state.failureTimestamps = state.failureTimestamps.filter((value) => now - value <= 24 * 60 * 60 * 1000);
+  return state.failureTimestamps;
+}
+
+function computeFailoverCount24h(now = Date.now()) {
+  routerState.failoverHistory = routerState.failoverHistory.filter((entry) => now - entry.atMs <= 24 * 60 * 60 * 1000);
+  return routerState.failoverHistory.length;
+}
+
+function recordBackendSuccess(key, { promoteActive = false } = {}) {
+  const state = routerState.backendState[key];
+  if (!state) return;
+  state.healthy = true;
+  state.lastCheckedAt = isoNow();
+  state.lastSuccessAt = state.lastCheckedAt;
+  state.lastError = null;
+  state.failureTimestamps = [];
+  state.circuitOpenUntil = null;
+  if (promoteActive) {
+    routerState.lastSuccessfulBackend = getBackendDefinition(key)?.label || key;
+    routerState.activeBackend = getBackendDefinition(key)?.label || key;
+  }
+}
+
+function summarizeError(error) {
+  if (!error) return 'unknown error';
+  const status = Number(error?.status || 0);
+  if (status > 0) {
+    return `${error.message || 'http_error'} (status=${status})`;
+  }
+  if (error.code && error.message) {
+    return `${error.code}: ${error.message}`;
+  }
+  return String(error.message || error);
+}
+
+function recordBackendFailure(key, error) {
+  const state = routerState.backendState[key];
+  if (!state) return;
+  const now = Date.now();
+  const summary = summarizeError(error);
+  state.healthy = false;
+  state.lastCheckedAt = isoNow();
+  state.lastFailureAt = state.lastCheckedAt;
+  state.lastError = summary;
+  state.failureTimestamps.push(now);
+  const recentFailures = pruneRecentFailures(key, now).filter((value) => now - value <= CIRCUIT_BREAKER_WINDOW_MS);
+  if (recentFailures.length >= CIRCUIT_BREAKER_THRESHOLD) {
+    state.circuitOpenUntil = new Date(now + CIRCUIT_BREAKER_COOLDOWN_MS).toISOString();
+  }
+  if (key === PRIMARY_BACKEND_KEY) {
+    routerState.lastPrimaryError = summary;
+    routerState.lastPrimaryFailureAt = state.lastFailureAt;
+  }
+}
+
+function recordFailover(fromKey, toKey, reason) {
+  const fromBackend = getBackendDefinition(fromKey);
+  const toBackend = getBackendDefinition(toKey);
+  const entry = {
+    at: isoNow(),
+    atMs: Date.now(),
+    from: fromBackend?.label || fromKey,
+    to: toBackend?.label || toKey,
+    reason: String(reason || '').trim() || null,
+  };
+  routerState.lastFailoverAt = entry.at;
+  routerState.failoverHistory.push(entry);
+  computeFailoverCount24h(entry.atMs);
+}
+
+function isCircuitOpen(key) {
+  const state = routerState.backendState[key];
+  if (!state?.circuitOpenUntil) return false;
+  return Date.parse(state.circuitOpenUntil) > Date.now();
+}
+
+async function probeBackendHealth(key, { force = false } = {}) {
+  const backend = getBackendDefinition(key);
+  const state = routerState.backendState[key];
+  if (!backend || !state) {
+    return { ok: false, configured: false, reason: 'unknown_backend' };
+  }
+  if (!backend.baseUrl) {
+    state.healthy = false;
+    state.lastCheckedAt = isoNow();
+    state.lastError = 'not_configured';
+    return { ok: false, configured: false, reason: 'not_configured' };
+  }
+  if (backend.key === 'openai' && !backend.apiKey) {
+    state.healthy = false;
+    state.lastCheckedAt = isoNow();
+    state.lastError = 'missing_api_key';
+    return { ok: false, configured: false, reason: 'missing_api_key' };
+  }
+
+  const lastCheckedMs = state.lastCheckedAt ? Date.parse(state.lastCheckedAt) : 0;
+  if (!force && lastCheckedMs && Date.now() - lastCheckedMs < BACKEND_HEALTH_CACHE_MS) {
+    return {
+      ok: state.healthy === true,
+      configured: true,
+      reason: state.lastError,
+      cached: true,
+    };
+  }
+
+  const healthUrl = joinBackendUrl(backend.baseUrl, backend.healthPath);
+  try {
+    const response = await fetch(healthUrl, {
+      method: 'GET',
+      headers: getBackendHeaders(key),
+    });
+    if (!response.ok) {
+      const error = new Error(`health_probe_failed:${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    recordBackendSuccess(key);
+    return { ok: true, configured: true, url: healthUrl };
+  } catch (error) {
+    recordBackendFailure(key, error);
+    return {
+      ok: false,
+      configured: true,
+      url: healthUrl,
+      reason: summarizeError(error),
+    };
+  }
+}
+
+async function probeConfiguredBackends({ force = false } = {}) {
+  const results = {};
+  for (const key of Object.keys(BACKEND_REGISTRY)) {
+    results[key] = await probeBackendHealth(key, { force });
+  }
+  return results;
+}
+
+function selectBackendOrder(model) {
+  const modelLower = String(model || '').toLowerCase();
+  if (!modelLower) {
+    return ['llama_server', 'ollama', 'openai'];
+  }
   if (modelLower.includes('gpt-')) {
-    return BACKENDS.openai;
+    return ['openai'];
   }
-  
-  // Ollama models (qwen, mistral, codellama, etc.)
-  if (modelLower.includes('qwen') || 
-      modelLower.includes('mistral') || 
-      modelLower.includes('codellama') ||
-      modelLower.includes('deepseek')) {
-    return BACKENDS.ollama;
+  if (
+    modelLower.includes('qwen') ||
+    modelLower.includes('mistral') ||
+    modelLower.includes('codellama') ||
+    modelLower.includes('deepseek')
+  ) {
+    return ['ollama', 'llama_server', 'openai'];
   }
-  
-  // LLaMA models (default)
-  return BACKENDS.llama_local || BACKENDS.openai || BACKENDS.ollama;
+  return ['llama_server', 'ollama', 'openai'];
+}
+
+function getBackendStateSnapshot() {
+  const primaryState = routerState.backendState[PRIMARY_BACKEND_KEY] || {};
+  const ollamaState = routerState.backendState.ollama || {};
+  const openaiState = routerState.backendState.openai || {};
+  return {
+    primaryBackend: routerState.primaryBackend,
+    activeBackend: routerState.activeBackend,
+    primaryHealthy: primaryState.healthy === true,
+    ollamaHealthy: ollamaState.healthy === true,
+    openaiHealthy: openaiState.healthy === true,
+    lastPrimaryError: routerState.lastPrimaryError,
+    lastPrimaryFailureAt: routerState.lastPrimaryFailureAt,
+    lastFailoverAt: routerState.lastFailoverAt,
+    failoverCount24h: computeFailoverCount24h(),
+    lastSuccessfulBackend: routerState.lastSuccessfulBackend,
+    backendState: Object.fromEntries(
+      Object.keys(routerState.backendState).map((key) => {
+        const state = routerState.backendState[key];
+        return [key, {
+          backend: getBackendDefinition(key)?.label || key,
+          url: getBackendDefinition(key)?.baseUrl || null,
+          healthy: state.healthy,
+          lastCheckedAt: state.lastCheckedAt,
+          lastSuccessAt: state.lastSuccessAt,
+          lastFailureAt: state.lastFailureAt,
+          lastError: state.lastError,
+          circuitOpenUntil: state.circuitOpenUntil,
+        }];
+      })
+    ),
+    recentFailovers: routerState.failoverHistory.slice(-10).map(({ atMs, ...entry }) => entry),
+  };
 }
 
 // DEV ENGINE: Build developer-optimized prompt
@@ -101,12 +373,14 @@ ${userPrompt}
 }
 
 // Health check
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  await probeConfiguredBackends({ force: true });
   res.json({
     ok: true,
     service: 'cerbere-dev-engine',
     port: PORT,
-    backends: Object.keys(BACKENDS).filter(k => BACKENDS[k])
+    backends: Object.keys(BACKENDS).filter(k => BACKENDS[k]),
+    ...getBackendStateSnapshot(),
   });
 });
 
@@ -314,7 +588,7 @@ async function handleDownloadFile(msg) {
 app.post("/v1/chat/completions", async (req, res) => {
   const body = req.body || {};
   const model = body.model || "llama3.2:latest";
-  const messages = body.messages || [];
+  const messages = sanitizeChatMessages(body.messages || []);
   const stream = body.stream === true;
 
   // Contexte dev (comme tu l'avais)
@@ -344,23 +618,21 @@ app.post("/v1/chat/completions", async (req, res) => {
       const enhancedPrompt = buildDeveloperPrompt(lastMessage.content, devContext);
       enhancedMessages = [
         ...messages.slice(0, -1),
-        { role: "user", content: enhancedPrompt },
+        { role: "user", content: sanitizeUtf8Text(enhancedPrompt) },
       ];
     }
   }
 
-  const backend = selectBackend(model);
-  if (!backend) {
+  const backendOrder = selectBackendOrder(model)
+    .map((key) => getBackendDefinition(key))
+    .filter((backend) => backend?.baseUrl);
+
+  if (!backendOrder.length) {
     return res.status(502).json({
       error: "no_backend_available",
       detail: `No backend configured for model: ${model}`,
     });
   }
-
-  const upstreamUrl = `${backend.replace(/\/$/, "")}/v1/chat/completions`;
-  console.log(`[Cerbère] Routing to: ${upstreamUrl}`);
-  console.log(`[Cerbère] Model: ${model}`);
-  console.log(`[Cerbère] Dev mode: ${isDeveloperMode}`);
 
   const upstreamBody = {
     ...body,
@@ -368,25 +640,99 @@ app.post("/v1/chat/completions", async (req, res) => {
     messages: enhancedMessages,
     stream,
   };
+  const bypassActionExecution =
+    String(req.headers["x-a11-passthrough"] || "").trim() === "1" ||
+    body?.a11Passthrough === true;
 
-  try {
-    const response = await fetch(upstreamUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(upstreamBody),
-    });
+  const primaryBackend = backendOrder[0];
+  let successfulBackend = null;
+  let upstreamUrl = null;
+  let response = null;
+  let lastError = null;
+  const failureSummaries = [];
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      return res.status(response.status).json({
-        error: "upstream_error",
-        status: response.status,
-        detail: errorText,
-      });
+  console.log(`[Cerbère] Backend order for model ${model}: ${backendOrder.map((entry) => entry.label).join(' -> ')}`);
+  console.log(`[Cerbère] Dev mode: ${isDeveloperMode}`);
+
+  for (const backend of backendOrder) {
+    const backendKey = backend.key;
+    upstreamUrl = joinBackendUrl(backend.baseUrl, backend.chatPath);
+    const probe = await probeBackendHealth(backendKey);
+
+    if (isCircuitOpen(backendKey)) {
+      const state = routerState.backendState[backendKey];
+      const summary = `${backend.label} circuit breaker open until ${state?.circuitOpenUntil}`;
+      failureSummaries.push({ backend: backend.label, reason: summary, skipped: true });
+      console.warn(`[Cerbère] ${summary}`);
+      continue;
     }
 
+    if (probe.ok !== true) {
+      const summary = String(probe.reason || 'health_probe_failed');
+      failureSummaries.push({ backend: backend.label, reason: summary, skipped: true });
+      console.warn(`[Cerbère] ${backend.label} unhealthy -> ${summary}`);
+      if (backendKey === PRIMARY_BACKEND_KEY) {
+        routerState.lastPrimaryError = summary;
+        routerState.lastPrimaryFailureAt = isoNow();
+      }
+      continue;
+    }
+
+    console.log(`[Cerbère] Trying backend ${backend.label}: ${upstreamUrl}`);
+
+    try {
+      response = await fetch(upstreamUrl, {
+        method: "POST",
+        headers: getBackendHeaders(backendKey),
+        body: JSON.stringify(upstreamBody),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        const error = new Error(`upstream_error:${response.status}`);
+        error.status = response.status;
+        error.detail = errorText;
+        throw error;
+      }
+
+      successfulBackend = backend;
+      recordBackendSuccess(backendKey, { promoteActive: true });
+      if (primaryBackend && backend.key !== primaryBackend.key) {
+        const failoverReason = summarizeError(lastError || routerState.backendState[PRIMARY_BACKEND_KEY]?.lastError || 'primary_unavailable');
+        console.warn(`[Cerbère] failover to ${backend.label} (primary=${primaryBackend.label}, reason=${failoverReason})`);
+        recordFailover(primaryBackend.key, backend.key, failoverReason);
+      }
+      console.log(`[Cerbère] ${backend.label} success`);
+      break;
+    } catch (error) {
+      recordBackendFailure(backendKey, error);
+      lastError = error;
+      const summary = summarizeError(error);
+      failureSummaries.push({ backend: backend.label, reason: summary, skipped: false });
+      console.warn(`[Cerbère] ${backend.label} failed -> ${summary}`);
+      if (backendKey === PRIMARY_BACKEND_KEY) {
+        routerState.lastPrimaryError = summary;
+        routerState.lastPrimaryFailureAt = isoNow();
+      }
+    }
+  }
+
+  if (!response || !successfulBackend) {
+    const lastSummary = summarizeError(lastError);
+    return res.status(502).json({
+      error: "router_error",
+      message: lastSummary,
+      detail: lastError?.detail || String(lastError || 'no_backend_available'),
+      failover: getBackendStateSnapshot(),
+      attempts: failureSummaries,
+    });
+  }
+
+  res.setHeader('X-Cerbere-Primary-Backend', primaryBackend?.label || routerState.primaryBackend);
+  res.setHeader('X-Cerbere-Active-Backend', successfulBackend.label);
+  res.setHeader('X-Cerbere-Failover', successfulBackend.key !== primaryBackend?.key ? '1' : '0');
+
+  try {
     // STREAM -> on ne peut pas intercepter les actions
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream");
@@ -405,7 +751,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       "";
 
     // On essaie de trouver une enveloppe JSON dans le texte
-    const envelope = parseEnvelope(rawContent);
+    const envelope = bypassActionExecution ? null : parseEnvelope(rawContent);
 
     if (envelope && envelope.mode === "actions") {
       const actions = Array.isArray(envelope.actions) ? envelope.actions : [];
@@ -435,13 +781,22 @@ app.post("/v1/chat/completions", async (req, res) => {
         `J'ai exécuté ${actions.length} action(s).`;
 
       if (data.choices && data.choices[0] && data.choices[0].message) {
-        data.choices[0].message.content = summary;
-      }
+      data.choices[0].message.content = sanitizeUtf8Text(summary);
+    }
 
       data.a11_actions = actions;
       data.a11_results = results;
     }
 
+    if (data?.choices?.[0]?.message?.content) {
+      data.choices[0].message.content = sanitizeUtf8Text(data.choices[0].message.content);
+    }
+    data.cerbere = {
+      ...(data.cerbere && typeof data.cerbere === 'object' ? data.cerbere : {}),
+      primaryBackend: primaryBackend?.label || routerState.primaryBackend,
+      activeBackend: successfulBackend.label,
+      failover: successfulBackend.key !== primaryBackend?.key,
+    };
     return res.json(data);
   } catch (err) {
     console.error("[Cerbère] Error:", err.message);
@@ -454,7 +809,8 @@ app.post("/v1/chat/completions", async (req, res) => {
 });
 
 // Correction: endpoint stats compatible legacy et nouveau
-app.get(['/api/stats', '/api/llm/stats'], (req, res) => {
+app.get(['/api/stats', '/api/llm/stats'], async (req, res) => {
+  await probeConfiguredBackends({ force: true });
   res.json({
     service: 'cerbere-dev-engine',
     version: '2.0.0',
@@ -464,10 +820,23 @@ app.get(['/api/stats', '/api/llm/stats'], (req, res) => {
       'dev_engine',
       'nossen_protocol',
       'multi_backend_routing',
-      'smart_prompting'
-    ]
+      'smart_prompting',
+      'observable_failover',
+      'circuit_breaker'
+    ],
+    ...getBackendStateSnapshot(),
   });
 });
+
+probeConfiguredBackends({ force: true }).catch((error) => {
+  console.warn('[Cerbère] backend probe bootstrap failed:', error?.message || error);
+});
+
+setInterval(() => {
+  probeConfiguredBackends().catch((error) => {
+    console.warn('[Cerbère] backend probe refresh failed:', error?.message || error);
+  });
+}, BACKEND_PROBE_INTERVAL_MS).unref();
 
 // Start server
 app.listen(PORT, "127.0.0.1", () => {

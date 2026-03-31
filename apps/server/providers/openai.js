@@ -18,14 +18,17 @@ function getClient() {
   if (!HAS_OPENAI) {
     throw new Error('OpenAI client not available: install the `openai` package in apps/server (npm i openai)');
   }
-  return new OpenAI.default({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.A11_OPENAI_BASE_URL || undefined });
+  return new OpenAI.default({
+    apiKey: process.env.OPENAI_API_KEY,
+    baseURL: process.env.A11_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || undefined
+  });
 }
 
 async function askOpenAI(opts) {
   if (!HAS_OPENAI) throw new Error('OpenAI unavailable: npm install openai in apps/server');
 
   const client = getClient();
-  const model = opts?.model || process.env.A11_OPENAI_MODEL || 'gpt-4o';
+  const model = opts?.model || process.env.A11_OPENAI_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
   const messages = Array.isArray(opts?.messages) ? opts.messages : (opts?.prompt ? [{ role: 'user', content: String(opts.prompt) }] : []);
 
   const res = await client.chat.completions.create({
@@ -43,7 +46,7 @@ async function streamOpenAI(opts, onChunk) {
   if (!HAS_OPENAI) throw new Error('OpenAI unavailable: npm install openai in apps/server');
 
   const client = getClient();
-  const model = opts?.model || process.env.A11_OPENAI_MODEL || 'gpt-4o';
+  const model = opts?.model || process.env.A11_OPENAI_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
   const messages = Array.isArray(opts?.messages) ? opts.messages : (opts?.prompt ? [{ role: 'user', content: String(opts.prompt) }] : []);
 
   try {

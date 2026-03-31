@@ -6,6 +6,12 @@
 # Per-app local env files (do not commit secrets)
 apps/server/.env.local
 apps/web/.env.local
+apps/server/node_modules/
+apps/server/dist/
+apps/server/.a11_state/
+apps/server/a11_runtime/
+apps/server/dev.log
+apps/server/tmp-restart-*.log
 
 # Encrypted env output (machine-protected)
 .env.enc

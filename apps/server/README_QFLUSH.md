@@ -6,7 +6,6 @@ Un système de supervision de processus intégré dans A11 qui gère automatique
 - **Cerbère** (LLM Router) sur port 4545
 - **LLaMA Server** sur port 8000
 - **TTS Service** (Piper) sur port 5002
-- **Frontend** (Vite) sur port 5173 (dev uniquement)
 - **Backend** (server.cjs) sur port 3000
 
 Avec auto-restart, logging détaillé, et monitoring en temps réel.
@@ -21,7 +20,7 @@ npm install @funeste38/qflush
 ### Lancer tous les services avec supervision
 ```bash
 # Démarre le backend qui lance automatiquement les autres services
-cd D:\A11\apps\server
+cd D:\funesterie\a11\a11backendrailway\apps\server
 node server.cjs
 ```
 
@@ -73,7 +72,7 @@ Exemple de réponse:
 ✅ **Superviseur créé**: `apps/server/src/a11-supervisor.cjs`  
 ✅ **Intégration active**: Le serveur affiche `[QFLUSH] @funeste38/qflush module loaded successfully`  
 ✅ **Endpoint disponible**: `/api/qflush/status`  
-✅ **Services gérés**: Cerbère, LLaMA, TTS, Frontend (dev)
+✅ **Services gérés**: Cerbère, LLaMA, TTS
 
 ## 🔧 Configuration
 
@@ -92,10 +91,6 @@ LLAMA_BASE=                      # Laisser vide pour gestion auto
 
 # Gestion du service TTS
 MANAGE_TTS=true                  # Gérer le service TTS automatiquement
-
-# Gestion du Frontend (développement uniquement)
-MANAGE_FRONTEND=true             # Gérer Vite dev server
-NODE_ENV=development             # Requis pour frontend supervision
 
 # Configuration du superviseur
 MAX_RESTARTS=3                   # Nombre max de redémarrages auto
@@ -146,17 +141,15 @@ Si vous voulez gérer les services manuellement (avec `start_cerbere.ps1` par ex
 MANAGE_CERBERE=false
 MANAGE_LLAMA_SERVER=false
 MANAGE_TTS=false
-MANAGE_FRONTEND=false
 ```
 
 ### Mode hybride: supervision partielle
 
 ```bash
-# Ne gérer que Cerbère et LLaMA, pas TTS ni Frontend
+# Ne gérer que Cerbère et LLaMA, pas TTS
 MANAGE_CERBERE=true
 MANAGE_LLAMA_SERVER=true
 MANAGE_TTS=false
-MANAGE_FRONTEND=false
 ```
 
 ## 🎮 Contrôle des services via API
@@ -216,9 +209,6 @@ A11 Backend (server.cjs)
     │       │
     │       ├─> TTS Service (port 5002)
     │       │   └─> Piper text-to-speech
-    │       │
-    │       └─> Frontend Vite (port 5173) [dev only]
-    │           └─> React + TypeScript UI
     │
     └─> Express API (port 3000)
         ├─> /api/qflush/status
@@ -231,23 +221,22 @@ A11 Backend (server.cjs)
 
 Les logs de chaque service sont dans:
 ```
-D:\A11\apps\logs\supervisor\
+D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\
 ├── cerbere.log
 ├── llama-server.log
-├── tts-service.log
-└── frontend-vite.log
+└── tts-service.log
 ```
 
 ### Voir les logs en temps réel
 ```powershell
 # Cerbère
-Get-Content D:\A11\apps\logs\supervisor\cerbere.log -Wait
+Get-Content D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\cerbere.log -Wait
 
 # LLaMA
-Get-Content D:\A11\apps\logs\supervisor\llama-server.log -Wait
+Get-Content D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\llama-server.log -Wait
 
 # TTS
-Get-Content D:\A11\apps\logs\supervisor\tts-service.log -Wait
+Get-Content D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\tts-service.log -Wait
 ```
 
 ## 🎯 Cas d'usage
@@ -279,7 +268,6 @@ node server.cjs
 MANAGE_CERBERE=false
 MANAGE_LLAMA_SERVER=false
 MANAGE_TTS=false
-MANAGE_FRONTEND=false
 
 # Lance les services manuellement
 .\start_cerbere.ps1
@@ -306,14 +294,14 @@ MANAGE_TTS=true
 
 Vérifiez que le fichier existe:
 ```bash
-Test-Path D:\A11\apps\server\llm-router.mjs
+Test-Path D:\funesterie\a11\a11backendrailway\apps\server\llm-router.mjs
 ```
 
 ### TTS ne démarre pas
 
 Vérifiez que Python et le script existent:
 ```bash
-Test-Path D:\A11\tts\serve.py
+Test-Path D:\funesterie\a11\a11backendrailway\apps\tts\serve.py
 python --version
 ```
 
@@ -355,6 +343,6 @@ Le message suivant dans les logs confirme que l'intégration fonctionne:
 - **Start all services manually**: `start_cerbere.ps1`
 - **Cerbère (LLM Router)**: http://127.0.0.1:4545
 - **Backend A11**: http://127.0.0.1:3000
-- **Frontend**: http://127.0.0.1:5173
+- **Frontend**: voir `D:\funesterie\a11\a11frontendnetlify\apps\web`
 - **LLaMA Server**: http://127.0.0.1:8000
 - **TTS Service**: http://127.0.0.1:5002

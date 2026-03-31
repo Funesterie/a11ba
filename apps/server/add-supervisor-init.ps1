@@ -1,6 +1,6 @@
 # Script pour ajouter l'initialisation du superviseur QFlush dans start()
 
-$serverFile = "D:\A11\apps\server\server.cjs"
+$serverFile = Join-Path $PSScriptRoot "server.cjs"
 
 Write-Host "[QFLUSH] Backup du fichier server.cjs..." -ForegroundColor Cyan
 Copy-Item $serverFile "$serverFile.before-supervisor-init" -Force
@@ -95,5 +95,5 @@ if (-not $alreadyExists) {
 
 Write-Host ""
 Write-Host "Prochaine étape: Redémarrer le serveur" -ForegroundColor Cyan
-Write-Host "  cd D:\A11\apps\server" -ForegroundColor White
+Write-Host ("  cd " + $PSScriptRoot) -ForegroundColor White
 Write-Host "  node server.cjs" -ForegroundColor White

@@ -3,7 +3,7 @@
  * Call setA11HostBridge from WebView2 to initialize
  */
 
-const { setA11HostBridge } = require('./routes/a11host.cjs');
+const { setA11HostBridge } = require('../a11host.cjs');
 
 // Expose globally for WebView2 context
 if (typeof globalThis !== 'undefined') {

@@ -35,7 +35,7 @@ Module d'intégration unifié:
 
 ### Démarrage du serveur
 ```bash
-cd D:\A11\apps\server
+cd D:\funesterie\a11\a11backendrailway\apps\server
 node server.cjs
 ```
 
@@ -170,7 +170,7 @@ supervisor.on('error', ({ name, error }) => {
 
 Les logs des processus supervisés sont stockés dans:
 ```
-D:\A11\apps\logs\supervisor\
+D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\
 ├── llama-server.log
 ├── mon-service.log
 └── ...
@@ -210,21 +210,21 @@ Vérifiez que:
 1. `LLAMA_BASE` n'est PAS défini (ou vide)
 2. `LLM_ROUTER_URL` n'est PAS défini (ou vide)
 3. `MANAGE_LLAMA_SERVER` n'est PAS `false`
-4. llama-server.exe existe dans `D:\A11\llama.cpp\build\bin\Release\`
-5. Un modèle GGUF existe dans `D:\A11\Models\`
+4. llama-server.exe existe dans `D:\funesterie\a11\a11llm\llm\server\`
+5. Un modèle GGUF existe dans `D:\funesterie\a11\a11llm\llm\models\`
 
 ### Voir les logs du superviseur
 ```bash
 # Logs en temps réel
-Get-Content D:\A11\apps\logs\supervisor\llama-server.log -Wait
+Get-Content D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\llama-server.log -Wait
 
 # Dernières 50 lignes
-Get-Content D:\A11\apps\logs\supervisor\llama-server.log -Tail 50
+Get-Content D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\llama-server.log -Tail 50
 ```
 
 ### Tester le superviseur isolément
 ```bash
-cd D:\A11\apps\server
+cd D:\funesterie\a11\a11backendrailway\apps\server
 node test-qflush.cjs
 ```
 

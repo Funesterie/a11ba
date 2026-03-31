@@ -1,8 +1,14 @@
 const { askOpenAI, streamOpenAI } = require("../../providers/openai");
+const { countMessageTokens } = require("../../utils/tokenizer");
 const { buildLongTermMemorySnippet } = require("../../lib/a11-longterm.cjs");
 
 function registerOpenAIRoutes(router) {
   // POST /llm/openai
+
+  // Limite contextuelle (OpenAI GPT-4o: 4096 tokens, ajustable)
+  const MAX_TOKENS = 4096;
+  const MIN_MESSAGES = 4;
+
   router.post('/llm/openai', async (req, res) => {
     try {
       const { prompt, history, model, systemPrompt } = req.body || {};
@@ -11,7 +17,7 @@ function registerOpenAIRoutes(router) {
         return res.status(400).json({ ok: false, error: 'Missing prompt or history' });
       }
 
-      const messages = (Array.isArray(history) && history.length)
+      let messages = (Array.isArray(history) && history.length)
         ? history
         : [
             systemPrompt ? { role: 'system', content: systemPrompt } : null,
@@ -20,13 +26,28 @@ function registerOpenAIRoutes(router) {
 
       // Inject long-term memory snippet as a system message
       const ltmSnippet = await buildLongTermMemorySnippet();
-      const finalMessages = [
+      messages = [
         ...messages,
         { role: 'system', content: ltmSnippet }
       ];
 
-      const output = await askOpenAI({ model, systemPrompt, messages: finalMessages });
+      // Si trop de tokens, on résume/tronque l'historique
+      let totalTokens = countMessageTokens(messages);
+      if (totalTokens > MAX_TOKENS) {
+        // On garde le systemPrompt, le dernier message user, et on résume le reste
+        const systemMsg = messages.find(m => m.role === 'system');
+        const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+        const assistantMsgs = messages.filter(m => m.role === 'assistant');
+        // Génère un résumé simple des anciens messages
+        const summary = `Résumé des échanges précédents :\n` + assistantMsgs.map(m => m.content).join(' ');
+        messages = [
+          ...(systemMsg ? [systemMsg] : []),
+          { role: 'system', content: summary.slice(0, 1000) },
+          ...(lastUserMsg ? [lastUserMsg] : [])
+        ];
+      }
 
+      const output = await askOpenAI({ model, systemPrompt, messages });
       res.json({ ok: true, output });
     } catch (err) {
       console.error('[A11/OpenAI] error:', err);

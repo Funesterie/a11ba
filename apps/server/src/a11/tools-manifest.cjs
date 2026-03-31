@@ -2,16 +2,21 @@
 
 const path = require("node:path");
 
-const WORKSPACE_ROOTS = [
+const configuredWorkspaceRoot = String(process.env.A11_WORKSPACE_ROOT || process.env.WORKSPACE_ROOT || '').trim();
+const defaultWorkspaceRoot = configuredWorkspaceRoot
+  ? path.resolve(configuredWorkspaceRoot)
+  : path.resolve(process.cwd());
+
+const WORKSPACE_ROOTS = Array.from(new Set([
+  defaultWorkspaceRoot,
   "D:\\A11",
-  "D:\\A12"
-];
+  "D:\\A12",
+]));
 
 const DEFAULT_WORKSPACE_ROOT = WORKSPACE_ROOTS[0];
 
 const SAFE_DATA_ROOT = path.resolve(
-  WORKSPACE_ROOTS[1] || WORKSPACE_ROOTS[0],
-  "."
+  process.env.A11_SAFE_DATA_ROOT || path.join(DEFAULT_WORKSPACE_ROOT, "a11_runtime")
 );
 
 const TOOL_MANIFEST = {
@@ -27,6 +32,54 @@ const TOOL_MANIFEST = {
     args: {
       flow: "string (nom du flow, ex: 'pdf_report_basic', 'web_to_pdf_report', 'encode_oc8')",
       payload: "object (paramètres pour le flow)"
+    }
+  },
+  qflush_memory_write: {
+    description: "Ecrit une memoire ephemere dans QFLUSH avec TTL.",
+    dangerLevel: "low",
+    args: {
+      key: "string (cle memoire)",
+      value: "any (valeur JSON courte)",
+      ttlSec: "number (optionnel, TTL en secondes)",
+      scope: "string (optionnel, scope logique)",
+      namespace: "string (optionnel, namespace logique)"
+    }
+  },
+  qflush_memory_read: {
+    description: "Lit une memoire ephemere depuis QFLUSH.",
+    dangerLevel: "low",
+    args: {
+      key: "string (cle memoire)",
+      scope: "string (optionnel)",
+      namespace: "string (optionnel)"
+    }
+  },
+  qflush_memory_list: {
+    description: "Liste les memoires ephemeres QFLUSH pour un scope donne.",
+    dangerLevel: "low",
+    args: {
+      scope: "string (optionnel)",
+      namespace: "string (optionnel)",
+      prefix: "string (optionnel)",
+      limit: "number (optionnel)"
+    }
+  },
+  qflush_memory_delete: {
+    description: "Supprime une memoire ephemere precise dans QFLUSH.",
+    dangerLevel: "low",
+    args: {
+      key: "string (cle memoire)",
+      scope: "string (optionnel)",
+      namespace: "string (optionnel)"
+    }
+  },
+  qflush_memory_clear: {
+    description: "Vide les memoires ephemeres QFLUSH pour un scope/namespace.",
+    dangerLevel: "medium",
+    args: {
+      scope: "string (optionnel)",
+      namespace: "string (optionnel)",
+      prefix: "string (optionnel)"
     }
   },
   fs_read: {
@@ -130,6 +183,51 @@ const TOOL_MANIFEST = {
     dangerLevel: "medium",
     args: { path: "chemin absolu" }
   },
+  vs_workspace_root: {
+    description: "Retourne le workspace root vu par A11Host/Visual Studio.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_compilation_errors: {
+    description: "Retourne les erreurs de compilation remontées par A11Host/Visual Studio.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_project_structure: {
+    description: "Retourne la structure projet/solution remontée par A11Host/Visual Studio.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_solution_info: {
+    description: "Retourne les informations de solution ouvertes dans Visual Studio.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_active_document: {
+    description: "Retourne le document actif dans Visual Studio si disponible.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_current_selection: {
+    description: "Retourne la sélection courante dans Visual Studio si disponible.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_goto_line: {
+    description: "Ouvrir un fichier et aller à une ligne précise dans Visual Studio si disponible.",
+    dangerLevel: "medium",
+    args: { path: "chemin absolu", line: "number (ligne 1-based)" }
+  },
+  vs_open_documents: {
+    description: "Liste les documents actuellement ouverts dans Visual Studio/A11Host.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_execute_shell: {
+    description: "Exécute une commande shell via A11Host avec la même whitelist safe que l'outil shell local.",
+    dangerLevel: "high",
+    args: { command: "string (doit correspondre à une commande autorisée)" }
+  },
   vs_build_solution: {
     description: "Lancer un build solution dans Visual Studio.",
     dangerLevel: "medium",
@@ -195,6 +293,161 @@ const TOOL_MANIFEST = {
     description: "Télécharger un fichier depuis une URL dans le workspace.",
     constraints: { roots: WORKSPACE_ROOTS },
     args: { url: "string", outputPath: "chemin absolu" }
+  },
+  share_file: {
+    description: "Publie un fichier local dans l'espace A-11 et peut l'envoyer par email.",
+    dangerLevel: "medium",
+    constraints: { roots: WORKSPACE_ROOTS, requiresAuth: true },
+    args: {
+      path: "string (chemin absolu ou relatif vers un fichier local)",
+      filename: "string (optionnel, nom force pour le stockage)",
+      contentType: "string (optionnel)",
+      emailTo: "string|string[] (optionnel, un ou plusieurs destinataires email)",
+      emailSubject: "string (optionnel)",
+      emailMessage: "string (optionnel)",
+      attachToEmail: "bool (optionnel, joindre le fichier au mail)"
+    }
+  },
+  list_stored_files: {
+    description: "Liste les fichiers déjà stockés dans l'espace A-11 de l'utilisateur.",
+    dangerLevel: "low",
+    constraints: { requiresAuth: true },
+    args: {
+      limit: "number (optionnel, 1-100)"
+    }
+  },
+  list_resources: {
+    description: "Liste les ressources de conversation stockées par A-11 (fichiers ou artefacts).",
+    dangerLevel: "low",
+    constraints: { requiresAuth: true },
+    args: {
+      conversationId: "string (optionnel)",
+      kind: "string (optionnel, ex: 'file' ou 'artifact')",
+      limit: "number (optionnel, 1-100)"
+    }
+  },
+  get_latest_resource: {
+    description: "Retourne la ressource la plus recente d'une conversation ou d'un type donne.",
+    dangerLevel: "low",
+    constraints: { requiresAuth: true },
+    args: {
+      conversationId: "string (optionnel)",
+      kind: "string (optionnel, ex: 'file' ou 'artifact')"
+    }
+  },
+  email_resource: {
+    description: "Envoie par email une ressource déjà stockée par A-11 à partir de son resourceId.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      resourceId: "number (id de la ressource)",
+      to: "string|string[] (un ou plusieurs destinataires)",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      attachToEmail: "bool (optionnel)"
+    }
+  },
+  email_latest_resource: {
+    description: "Envoie par email la ressource la plus recente, sans avoir besoin de fournir un chemin ou resourceId.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      conversationId: "string (optionnel)",
+      kind: "string (optionnel, ex: 'file' ou 'artifact')",
+      to: "string|string[] (un ou plusieurs destinataires)",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      attachToEmail: "bool (optionnel)"
+    }
+  },
+  send_email: {
+    description: "Envoie un email texte, avec pieces jointes locales optionnelles.",
+    dangerLevel: "medium",
+    constraints: { roots: WORKSPACE_ROOTS, requiresAuth: true },
+    args: {
+      to: "string|string[] (un ou plusieurs destinataires)",
+      subject: "string (optionnel)",
+      message: "string (optionnel, corps texte)",
+      html: "string (optionnel, corps HTML)",
+      path: "string (optionnel, fichier local a joindre)",
+      paths: "string[] (optionnel, plusieurs fichiers a joindre)",
+      attachToEmail: "bool (optionnel, true par defaut si path/paths present)"
+    }
+  },
+  schedule_email: {
+    description: "Programme un email pour plus tard, avec pieces jointes locales optionnelles.",
+    dangerLevel: "medium",
+    constraints: { roots: WORKSPACE_ROOTS, requiresAuth: true },
+    args: {
+      to: "string|string[] (un ou plusieurs destinataires)",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      sendAt: "string ISO date/heure future (optionnel)",
+      delaySeconds: "number (optionnel, delai avant envoi)",
+      delayMinutes: "number (optionnel)",
+      path: "string (optionnel)",
+      paths: "string[] (optionnel)"
+    }
+  },
+  schedule_resource_email: {
+    description: "Programme l'envoi d'une ressource stockee a une date/heure future.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      resourceId: "number",
+      to: "string|string[]",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      sendAt: "string ISO date/heure future (optionnel)",
+      delaySeconds: "number (optionnel)",
+      delayMinutes: "number (optionnel)",
+      attachToEmail: "bool (optionnel)"
+    }
+  },
+  schedule_latest_resource_email: {
+    description: "Programme l'envoi de la ressource la plus recente sans donner de resourceId.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      conversationId: "string (optionnel)",
+      kind: "string (optionnel)",
+      to: "string|string[]",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      sendAt: "string ISO date/heure future (optionnel)",
+      delaySeconds: "number (optionnel)",
+      delayMinutes: "number (optionnel)",
+      attachToEmail: "bool (optionnel)"
+    }
+  },
+  list_scheduled_emails: {
+    description: "Liste les emails planifies par A-11 pour l'utilisateur courant.",
+    dangerLevel: "low",
+    constraints: { requiresAuth: true },
+    args: {
+      status: "string (optionnel: scheduled, running, sent, failed, cancelled)",
+      limit: "number (optionnel)"
+    }
+  },
+  cancel_scheduled_email: {
+    description: "Annule un email planifie tant qu'il n'a pas encore ete execute.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      jobId: "string (identifiant du job planifie)"
+    }
+  },
+  zip_and_email: {
+    description: "Cree une archive ZIP a partir de plusieurs chemins locaux puis l'envoie par email.",
+    dangerLevel: "medium",
+    constraints: { roots: WORKSPACE_ROOTS, requiresAuth: true },
+    args: {
+      inputPaths: "string[] (ou paths)",
+      outputPath: "string (optionnel)",
+      to: "string|string[]",
+      subject: "string (optionnel)",
+      message: "string (optionnel)"
+    }
   },
   a11_env_snapshot: {
     dangerLevel: "low",

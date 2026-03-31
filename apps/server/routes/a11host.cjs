@@ -8,8 +8,15 @@ const path = require('node:path');
 const fs = require('node:fs/promises');
 const childProcess = require('node:child_process');
 const util = require('node:util');
+const {
+  assertShellAllowed,
+  getShellAllowlistEntries,
+  getShellAllowlistSummary,
+  getShellToolName,
+} = require('../lib/safe-shell.cjs');
 
 const execAsync = util.promisify(childProcess.exec);
+const execFileAsync = util.promisify(childProcess.execFile);
 
 // =========================
 // BRIDGES & CONFIG
@@ -84,6 +91,129 @@ function setHeadlessConfig(cfg = {}) {
   console.log('[A11Host] Headless config updated:', headlessConfig);
 }
 
+const SHELL_TOOL_PROBE_TTL_MS = 30_000;
+let cachedShellRuntime = {
+  expiresAt: 0,
+  value: null,
+};
+
+function normalizeShellOutput(stdout, stderr) {
+  return [String(stdout || '').trim(), String(stderr || '').trim()]
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function looksLikeMissingExecutable(message) {
+  const normalized = String(message || '').toLowerCase();
+  return (
+    normalized.includes('not found') ||
+    normalized.includes('is not recognized as an internal or external command') ||
+    normalized.includes('command not found') ||
+    normalized.includes('enoent')
+  );
+}
+
+function buildShellUnavailableMessage(command, stderr) {
+  const tool = getShellToolName(command) || String(command || '').trim().split(/\s+/)[0] || 'outil';
+  return `La commande "${tool}" n'est pas disponible sur ce runtime A11 pour le moment.`;
+}
+
+function normalizeShellExecutionResult(command, cwd, rawResult) {
+  if (rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)) {
+    const stdout = String(rawResult.stdout || '');
+    const stderr = String(rawResult.stderr || '');
+    const exitCode =
+      Number.isFinite(rawResult.exitCode) ? Number(rawResult.exitCode) :
+      rawResult.ok === false ? -1 : 0;
+    const unavailable =
+      rawResult.unavailable === true ||
+      (exitCode === 127) ||
+      looksLikeMissingExecutable(stderr || rawResult.message || '');
+    const output = String(rawResult.output || normalizeShellOutput(stdout, stderr));
+    const message = String(
+      rawResult.message ||
+      (unavailable ? buildShellUnavailableMessage(command, stderr) : '')
+    ).trim();
+
+    return {
+      ok: rawResult.ok !== false,
+      command: String(rawResult.command || command || '').trim(),
+      cwd: String(rawResult.cwd || cwd || '').trim() || null,
+      exitCode,
+      stdout,
+      stderr,
+      output,
+      unavailable,
+      message: message || null,
+    };
+  }
+
+  const output = String(rawResult || '').trim();
+  return {
+    ok: true,
+    command: String(command || '').trim(),
+    cwd: String(cwd || '').trim() || null,
+    exitCode: 0,
+    stdout: output,
+    stderr: '',
+    output,
+    unavailable: false,
+    message: null,
+  };
+}
+
+async function probeShellTool(tool) {
+  const binary = String(tool || '').trim();
+  if (!binary) return false;
+
+  try {
+    if (process.platform === 'win32') {
+      await execFileAsync('where', [binary], { windowsHide: true });
+    } else {
+      await execFileAsync('sh', ['-lc', `command -v ${binary}`]);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getHeadlessShellRuntime() {
+  const now = Date.now();
+  if (cachedShellRuntime.value && cachedShellRuntime.expiresAt > now) {
+    return cachedShellRuntime.value;
+  }
+
+  const entries = getShellAllowlistEntries();
+  const toolsToProbe = Array.from(new Set(entries.map((entry) => entry.tool).filter(Boolean)));
+  const toolPairs = await Promise.all(
+    toolsToProbe.map(async (tool) => [tool, await probeShellTool(tool)])
+  );
+  const tools = Object.fromEntries(toolPairs);
+  const unavailableTools = Object.entries(tools)
+    .filter(([, available]) => !available)
+    .map(([tool]) => tool);
+  const unavailableExamples = entries
+    .filter((entry) => entry.tool && tools[entry.tool] === false)
+    .map((entry) => entry.example);
+
+  const value = {
+    source: 'headless',
+    platform: process.platform,
+    probed: true,
+    tools,
+    unavailableTools,
+    unavailableExamples,
+  };
+
+  cachedShellRuntime = {
+    expiresAt: now + SHELL_TOOL_PROBE_TTL_MS,
+    value,
+  };
+  return value;
+}
+
 // =========================
 // HEADLESS HOST
 // =========================
@@ -117,13 +247,37 @@ const headlessHost = {
    * ExecuteShell : exécution d'une commande dans le workspace
    */
   async ExecuteShell(command) {
+    assertShellAllowed(command, 'ExecuteShell');
+
     const cwd =
       headlessConfig.shellCwd ||
       headlessConfig.workspaceRoot ||
       process.cwd();
 
-    const { stdout, stderr } = await execAsync(command, { cwd });
-    return stdout + (stderr ? '\n' + stderr : '');
+    try {
+      const { stdout, stderr } = await execAsync(command, { cwd });
+      return normalizeShellExecutionResult(command, cwd, {
+        ok: true,
+        command,
+        cwd,
+        exitCode: 0,
+        stdout,
+        stderr,
+      });
+    } catch (err) {
+      return normalizeShellExecutionResult(command, cwd, {
+        ok: false,
+        command,
+        cwd,
+        exitCode: Number.isFinite(err?.code) ? Number(err.code) : -1,
+        stdout: err?.stdout || '',
+        stderr: err?.stderr || err?.message || '',
+        unavailable: looksLikeMissingExecutable(err?.stderr || err?.message || ''),
+        message: looksLikeMissingExecutable(err?.stderr || err?.message || '')
+          ? buildShellUnavailableMessage(command, err?.stderr || err?.message || '')
+          : null,
+      });
+    }
   },
 
   /**
@@ -155,6 +309,135 @@ const headlessHost = {
   // GetActiveDocument, etc.) ne sont pas implémentables proprement en
   // headless, donc on les laisse non définies ici.
 };
+
+function collectFunctionNames(target) {
+  if (!target || (typeof target !== 'object' && typeof target !== 'function')) {
+    return [];
+  }
+
+  const names = new Set();
+  let current = target;
+  while (current && current !== Object.prototype) {
+    for (const name of Object.getOwnPropertyNames(current)) {
+      if (name === 'constructor') continue;
+      try {
+        if (typeof target[name] === 'function' || typeof current[name] === 'function') {
+          names.add(name);
+        }
+      } catch {
+        // Ignore getters/properties that throw.
+      }
+    }
+    current = Object.getPrototypeOf(current);
+  }
+
+  return Array.from(names).sort();
+}
+
+function getBridgeMethods() {
+  return collectFunctionNames(a11HostBridge);
+}
+
+function getHeadlessMethods() {
+  return collectFunctionNames(headlessHost);
+}
+
+function isA11HostMethodAvailable(methodName) {
+  return (
+    !!(a11HostBridge && typeof a11HostBridge[methodName] === 'function') ||
+    typeof headlessHost[methodName] === 'function'
+  );
+}
+
+function buildCapabilityFlags() {
+  return {
+    workspaceRoot: isA11HostMethodAvailable('GetWorkspaceRoot'),
+    compilationErrors: isA11HostMethodAvailable('GetCompilationErrors'),
+    projectStructure: isA11HostMethodAvailable('GetProjectStructure'),
+    solutionInfo: isA11HostMethodAvailable('GetSolutionInfo'),
+    activeDocument: isA11HostMethodAvailable('GetActiveDocument'),
+    currentSelection: isA11HostMethodAvailable('GetCurrentSelection'),
+    insertAtCursor: isA11HostMethodAvailable('InsertAtCursor'),
+    replaceSelection: isA11HostMethodAvailable('ReplaceSelection'),
+    openFile: isA11HostMethodAvailable('OpenFile'),
+    gotoLine: isA11HostMethodAvailable('GotoLine'),
+    openDocuments: isA11HostMethodAvailable('GetOpenDocuments'),
+    buildSolution: isA11HostMethodAvailable('BuildSolution'),
+    executeShell: isA11HostMethodAvailable('ExecuteShell'),
+    deleteFile: isA11HostMethodAvailable('DeleteFile'),
+    renameFile: isA11HostMethodAvailable('RenameFile')
+  };
+}
+
+async function getA11HostCapabilities() {
+  const bridgeMethods = getBridgeMethods();
+  const headlessMethods = getHeadlessMethods();
+  const activeMethods = Array.from(new Set([...bridgeMethods, ...headlessMethods])).sort();
+
+  let workspaceRoot = null;
+  try {
+    if (isA11HostMethodAvailable('GetWorkspaceRoot')) {
+      workspaceRoot = await callA11Host('GetWorkspaceRoot');
+    }
+  } catch (error) {
+    console.warn('[A11Host] Unable to resolve workspace root for status:', error.message);
+  }
+
+  const shellRuntime = a11HostBridge
+    ? {
+        source: 'vsix',
+        platform: process.platform,
+        probed: false,
+        tools: {},
+        unavailableTools: [],
+        unavailableExamples: [],
+      }
+    : await getHeadlessShellRuntime();
+
+  return {
+    mode: a11HostBridge ? 'vsix' : 'headless',
+    bridgeConnected: !!a11HostBridge,
+    safeMode: SAFE_MODE,
+    workspaceRoot,
+    shellCwd:
+      headlessConfig.shellCwd ||
+      headlessConfig.workspaceRoot ||
+      process.cwd(),
+    buildCommand: headlessConfig.buildCommand || process.env.A11_BUILD_COMMAND || null,
+    buildCommandConfigured: !!(headlessConfig.buildCommand || process.env.A11_BUILD_COMMAND),
+    methods: {
+      active: activeMethods,
+      bridge: bridgeMethods,
+      headless: headlessMethods
+    },
+    capabilities: buildCapabilityFlags(),
+    shellRuntime,
+    shellPolicy: {
+      whitelisted: true,
+      ...getShellAllowlistSummary()
+    }
+  };
+}
+
+async function getA11HostStatus() {
+  const capabilities = await getA11HostCapabilities();
+  return {
+    ok: true,
+    available: capabilities.methods.active.length > 0,
+    bridgeAvailable: capabilities.bridgeConnected,
+    headlessAvailable: capabilities.methods.headless.length > 0,
+    mode: capabilities.mode,
+    safeMode: capabilities.safeMode,
+    workspaceRoot: capabilities.workspaceRoot,
+    buildCommandConfigured: capabilities.buildCommandConfigured,
+    methods: capabilities.methods.active,
+    bridgeMethods: capabilities.methods.bridge,
+    headlessMethods: capabilities.methods.headless,
+    capabilities: capabilities.capabilities,
+    shellPolicy: capabilities.shellPolicy,
+    shellRuntime: capabilities.shellRuntime,
+  };
+}
 
 // =========================
 // CORE CALL DISPATCH
@@ -492,10 +775,32 @@ function registerA11HostRoutes(router) {
       if (!command) {
         return res.status(400).json({ ok: false, error: 'missing_command_parameter' });
       }
+      try {
+        assertShellAllowed(command, 'execute-shell');
+      } catch (err) {
+        return res.status(400).json({
+          ok: false,
+          error: 'command_not_allowed',
+          message: err.message,
+          shellPolicy: getShellAllowlistSummary()
+        });
+      }
       
-      const output = await callA11Host('ExecuteShell', command);
+      const cwd =
+        headlessConfig.shellCwd ||
+        headlessConfig.workspaceRoot ||
+        process.cwd();
+      const shellResult = normalizeShellExecutionResult(
+        command,
+        cwd,
+        await callA11Host('ExecuteShell', command)
+      );
       console.log(`[A11Host] ExecuteShell: ${command.substring(0, 50)}...`);
-      res.json({ ok: true, output, command });
+      res.json({
+        ok: true,
+        ...shellResult,
+        shellPolicy: getShellAllowlistSummary(),
+      });
     } catch (err) {
       console.error('[A11Host] ExecuteShell error:', err.message);
       res.status(500).json({ ok: false, error: err.message });
@@ -517,14 +822,26 @@ function registerA11HostRoutes(router) {
 
   // ========== UTILITY ENDPOINTS ==========
 
-  // GET /api/v1/vs/status - Check if A11Host bridge is available
-  router.get('/v1/vs/status', (req, res) => {
-    const available = !!a11HostBridge;
-    res.json({
-      ok: true,
-      available,
-      methods: available ? Object.keys(a11HostBridge).filter(k => typeof a11HostBridge[k] === 'function') : []
-    });
+  // GET /api/v1/vs/status - Check if A11Host bridge/headless mode is available
+  router.get('/v1/vs/status', async (req, res) => {
+    try {
+      const status = await getA11HostStatus();
+      res.json(status);
+    } catch (err) {
+      console.error('[A11Host] Status error:', err.message);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // GET /api/v1/vs/capabilities - richer capability snapshot
+  router.get('/v1/vs/capabilities', async (req, res) => {
+    try {
+      const capabilities = await getA11HostCapabilities();
+      res.json({ ok: true, ...capabilities });
+    } catch (err) {
+      console.error('[A11Host] Capabilities error:', err.message);
+      res.status(500).json({ ok: false, error: err.message });
+    }
   });
 
   console.log('[Server] ✓ A11Host routes registered (with headless fallback)');
@@ -534,5 +851,8 @@ module.exports = {
   registerA11HostRoutes,
   setA11HostBridge,
   callA11Host,
-  setHeadlessConfig
+  setHeadlessConfig,
+  getA11HostStatus,
+  getA11HostCapabilities,
+  isA11HostMethodAvailable
 };

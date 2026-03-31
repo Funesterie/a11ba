@@ -18,13 +18,17 @@
     "start": "node server.cjs",
     "dev:router": "node llm-router.cjs",
     "test": "echo 'No tests specified for server'",
-    "lint": "echo 'No linting configured for server'"
+    "test:contracts": "node --test ./test/*.node.test.cjs",
+    "test:e2e:artifact": "node tests/a11-artifact-flow.e2e.cjs",
+    "lint": "echo 'No linting configured for server'",
+    "build": "echo 'No build step needed for backend'",
+    "railway:build": "echo 'No build step needed for backend'"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1015.0",
     "@funeste38/bat": "^0.1.2",
     "@funeste38/envaptex": "^1.0.0",
-    "@funeste38/freeland": "^0.1.0",
+    "@funeste38/freeland": "^0.2.2",
     "@funeste38/nezlephant": "^0.1.0",
     "@funeste38/qflush": "3.1.7",
     "@funeste38/rome": "^1.5.3",

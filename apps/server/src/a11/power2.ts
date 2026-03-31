@@ -108,9 +108,12 @@ registerHorn("a11d.tunnel.status", async () => {
 });
 
 registerHorn("a11d.netlify.deploy", async () => {
+  const frontendDist =
+    process.env.A11_FRONTEND_DIST ||
+    path.resolve(process.cwd(), "..", "a11frontendnetlify", "dist");
   return await scream("a11d.shell.run", {
     cmd: "netlify",
-    args: ["deploy", "--dir", "apps/web/dist", "--prod"],
+    args: ["deploy", "--dir", frontendDist, "--prod"],
   });
 });
 

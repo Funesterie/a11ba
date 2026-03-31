@@ -1,6 +1,6 @@
 # Script to integrate QFlush into server.cjs
 
-$serverFile = "D:\A11\apps\server\server.cjs"
+$serverFile = Join-Path $PSScriptRoot "server.cjs"
 $content = Get-Content $serverFile -Raw
 
 # 1. Add qflush require after nezAuth require

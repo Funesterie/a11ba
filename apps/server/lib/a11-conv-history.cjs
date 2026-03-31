@@ -3,7 +3,34 @@ const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
 
-const WORKSPACE = "D:/A12"; // Adapter si besoin
+function resolveWorkspaceRoot() {
+  const envCandidates = [
+    process.env.A11_WORKSPACE_ROOT,
+    process.env.WORKSPACE_ROOT,
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+
+  for (const candidate of envCandidates) {
+    return path.resolve(candidate);
+  }
+
+  const filesystemCandidates = [
+    path.resolve(__dirname, '..', '..', '..'),
+    process.cwd(),
+    path.resolve(__dirname, '..'),
+  ];
+
+  for (const candidate of filesystemCandidates) {
+    if (fs.existsSync(path.join(candidate, 'a11_memory'))) {
+      return candidate;
+    }
+  }
+
+  return process.cwd();
+}
+
+const WORKSPACE = resolveWorkspaceRoot();
 const CONV_ROOT = path.join(WORKSPACE, "a11_memory", "conversations");
 const INDEX_PATH = path.join(CONV_ROOT, "conversations-index.json");
 

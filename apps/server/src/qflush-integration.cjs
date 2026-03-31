@@ -7,6 +7,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const net = require('node:net');
+const { spawn, spawnSync } = require('node:child_process');
 const { A11Supervisor } = require('./a11-supervisor.cjs');
 
 // Always available since we have our own implementation
@@ -26,6 +27,190 @@ function isPortInUse(port, host = '127.0.0.1') {
     });
     srv.listen(port, host);
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function findFirstExistingPath(candidates = []) {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function getListeningPid(port) {
+  try {
+    const result = spawnSync('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8' });
+    const output = String(result.stdout || '');
+    const line = output
+      .split(/\r?\n/)
+      .find((entry) => new RegExp(`^\\s*TCP\\s+\\S+:${port}\\s+\\S+\\s+LISTENING\\s+(\\d+)\\s*$`, 'i').test(entry));
+    if (!line) return null;
+    const match = line.match(/LISTENING\s+(\d+)\s*$/i);
+    return match?.[1] ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+function killProcessTree(pid) {
+  if (!pid) return false;
+  try {
+    const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    return result.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function ensureLogDir(logDir) {
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+}
+
+function spawnDetachedProcess(definition, logDir) {
+  ensureLogDir(logDir);
+  const logFile = path.join(logDir, `${definition.name}.log`);
+  const logFd = fs.openSync(logFile, 'a');
+  const child = spawn(definition.command, definition.args || [], {
+    cwd: definition.cwd || process.cwd(),
+    env: { ...process.env, ...(definition.env || {}) },
+    detached: true,
+    windowsHide: true,
+    stdio: ['ignore', logFd, logFd],
+  });
+  child.unref();
+  fs.closeSync(logFd);
+  return child;
+}
+
+function getBackendPort() {
+  return Number(process.env.PORT || 3000);
+}
+
+function getTtsPort() {
+  return Number(process.env.TTS_PORT || 5002);
+}
+
+function getLlmPort() {
+  return Number(process.env.LLAMA_PORT || process.env.LOCAL_LLM_PORT || 8080);
+}
+
+function isServiceEnabled(name) {
+  if (name === 'cerbere') return process.env.MANAGE_CERBERE !== 'false';
+  if (name === 'tts') return process.env.MANAGE_TTS !== 'false';
+  if (name === 'llama-server') return process.env.MANAGE_LLAMA_SERVER !== 'false';
+  return true;
+}
+
+function findLlamaExe() {
+  const serverRoot = path.resolve(__dirname, '..', '..', '..');
+  return findFirstExistingPath([
+    path.join(serverRoot, '..', 'a11llm', 'llm', 'server', 'llama-server.exe'),
+    path.join(serverRoot, '..', '..', 'a11llm', 'llm', 'server', 'llama-server.exe'),
+    'D:\\funesterie\\a11\\a11llm\\llm\\server\\llama-server.exe',
+  ]);
+}
+
+function findLlamaModel() {
+  const serverRoot = path.resolve(__dirname, '..', '..', '..');
+  return findFirstExistingPath([
+    process.env.DEFAULT_MODEL,
+    process.env.LLAMA_MODEL,
+    path.join(serverRoot, '..', 'a11llm', 'llm', 'models', 'Llama-3.2-3B-Instruct-Q4_K_M.gguf'),
+    path.join(serverRoot, '..', '..', 'a11llm', 'llm', 'models', 'Llama-3.2-3B-Instruct-Q4_K_M.gguf'),
+    'D:\\funesterie\\a11\\a11llm\\llm\\models\\Llama-3.2-3B-Instruct-Q4_K_M.gguf',
+  ]);
+}
+
+function buildKnownServiceRegistry() {
+  const serverDir = path.resolve(__dirname, '..');
+  const workspaceRoot = path.resolve(serverDir, '..');
+  const llmPort = getLlmPort();
+  const ttsPort = getTtsPort();
+  const backendPort = getBackendPort();
+  const ttsScript = findTTSScript(true);
+  const ttsDir = ttsScript ? path.dirname(ttsScript) : path.join(workspaceRoot, 'apps', 'tts');
+  const ttsModelPath = findFirstExistingPath([
+    process.env.TTS_MODEL_PATH,
+    process.env.MODEL_PATH,
+    path.join(ttsDir, 'fr_FR-siwis-medium.onnx'),
+    path.join(serverDir, 'tts', 'fr_FR-siwis-medium.onnx'),
+  ]);
+  const ttsPiperPath = findFirstExistingPath([
+    process.env.TTS_PIPER_PATH,
+    process.env.PIPER_PATH,
+    path.join(ttsDir, 'piper.exe'),
+  ]);
+  const ttsEspeakPath = findFirstExistingPath([
+    process.env.ESPEAK_DATA_PATH,
+    path.join(ttsDir, 'espeak-ng-data'),
+  ]);
+  const llamaExe = findLlamaExe();
+  const llamaModel = findLlamaModel();
+  const cerbereScript = path.join(serverDir, 'llm-router.mjs');
+
+  return {
+    cerbere: {
+      name: 'cerbere',
+      port: 4545,
+      available: isServiceEnabled('cerbere') && fs.existsSync(cerbereScript),
+      command: process.execPath,
+      args: [cerbereScript],
+      cwd: path.dirname(cerbereScript),
+      env: {
+        PORT: '4545',
+        LLM_ROUTER_PORT: '4545',
+        LOCAL_LLM_PORT: String(llmPort),
+        LLAMA_PORT: String(llmPort),
+        LOCAL_LLM_URL: `http://127.0.0.1:${llmPort}`,
+        LLAMA_BASE: `http://127.0.0.1:${llmPort}`,
+      },
+      autoRestart: true,
+    },
+    tts: {
+      name: 'tts',
+      port: ttsPort,
+      available: isServiceEnabled('tts') && Boolean(ttsScript),
+      command: ttsScript && ttsScript.endsWith('.py') ? 'python' : 'node',
+      args: ttsScript ? [ttsScript] : [],
+      cwd: ttsDir,
+      env: {
+        PORT: String(ttsPort),
+        TTS_PORT: String(ttsPort),
+        BASE_URL: `http://127.0.0.1:${ttsPort}`,
+        MODEL_PATH: ttsModelPath || '',
+        PIPER_PATH: ttsPiperPath || '',
+        ESPEAK_DATA_PATH: ttsEspeakPath || '',
+        A11_AVATAR_UPDATE_URL: `http://127.0.0.1:${backendPort}/api/avatar/update`,
+      },
+      autoRestart: true,
+    },
+    'llama-server': {
+      name: 'llama-server',
+      port: llmPort,
+      available: isServiceEnabled('llama-server') && Boolean(llamaExe && llamaModel),
+      command: llamaExe || '',
+      args: llamaExe && llamaModel ? ['-m', llamaModel, '--port', String(llmPort), '--host', '127.0.0.1'] : [],
+      cwd: llamaExe ? path.dirname(llamaExe) : process.cwd(),
+      env: {},
+      autoRestart: true,
+    },
+  };
+}
+
+function isRegisteredInSupervisor(supervisor, processName) {
+  return Boolean(supervisor?.processes && typeof supervisor.processes.has === 'function' && supervisor.processes.has(processName));
+}
+
+function isActivelyManagedBySupervisor(supervisor, processName) {
+  if (!isRegisteredInSupervisor(supervisor, processName)) return false;
+  const entry = supervisor.processes.get(processName);
+  return Boolean(entry?.status === 'running' && entry?.pid);
 }
 
 /**
@@ -56,22 +241,29 @@ function registerProcess(supervisor, processConfig) {
  * @returns {boolean} Success status
  */
 async function startProcess(supervisor, processName) {
-  if (!supervisor) {
-    console.warn('[Supervisor] Cannot start process: supervisor not initialized');
-    return false;
-  }
-
   try {
-    // Prevent duplicate Cerbère instances on port 4545
-    if (processName === 'cerbere') {
-      const inUse = await isPortInUse(4545);
-      if (inUse) {
-        console.warn('[Supervisor] Cerbère port 4545 already in use — skipping start');
-        return false;
+    const definition = buildKnownServiceRegistry()[processName];
+    if (definition?.port) {
+      const existingPid = getListeningPid(definition.port);
+      if (existingPid) {
+        console.warn(`[Supervisor] ${processName} already running on ${definition.port} (PID ${existingPid})`);
+        return true;
       }
     }
 
-    supervisor.start(processName);
+    if (supervisor && isRegisteredInSupervisor(supervisor, processName)) {
+      supervisor.start(processName);
+      return true;
+    }
+
+    if (!definition || !definition.available || !definition.command) {
+      console.warn(`[Supervisor] Cannot start ${processName}: no runnable definition`);
+      return false;
+    }
+
+    const logDir = supervisor?.config?.logDir || path.resolve(__dirname, '../../logs/supervisor');
+    spawnDetachedProcess(definition, logDir);
+    await sleep(800);
     return true;
   } catch (e) {
     console.error('[Supervisor] Failed to start process:', e.message);
@@ -85,15 +277,29 @@ async function startProcess(supervisor, processName) {
  * @param {string} processName - Name of the process to stop
  * @returns {boolean} Success status
  */
-function stopProcess(supervisor, processName) {
-  if (!supervisor) {
-    console.warn('[Supervisor] Cannot stop process: supervisor not initialized');
-    return false;
-  }
-
+async function stopProcess(supervisor, processName) {
   try {
-    supervisor.stop(processName);
-    return true;
+    if (supervisor && isActivelyManagedBySupervisor(supervisor, processName)) {
+      supervisor.stop(processName);
+      await sleep(1000);
+      return true;
+    }
+
+    const definition = buildKnownServiceRegistry()[processName];
+    if (!definition?.port) {
+      console.warn(`[Supervisor] Cannot stop ${processName}: unknown target`);
+      return false;
+    }
+
+    const pid = getListeningPid(definition.port);
+    if (!pid) {
+      console.warn(`[Supervisor] ${processName} is already stopped`);
+      return true;
+    }
+
+    const killed = killProcessTree(pid);
+    await sleep(700);
+    return killed || !getListeningPid(definition.port);
   } catch (e) {
     console.error('[Supervisor] Failed to stop process:', e.message);
     return false;
@@ -106,15 +312,16 @@ function stopProcess(supervisor, processName) {
  * @param {string} processName - Name of the process to restart
  * @returns {boolean} Success status
  */
-function restartProcess(supervisor, processName) {
-  if (!supervisor) {
-    console.warn('[Supervisor] Cannot restart process: supervisor not initialized');
-    return false;
-  }
-
+async function restartProcess(supervisor, processName) {
   try {
-    supervisor.restart(processName);
-    return true;
+    if (supervisor && isActivelyManagedBySupervisor(supervisor, processName)) {
+      supervisor.restart(processName);
+      await sleep(1200);
+      return true;
+    }
+
+    await stopProcess(supervisor, processName);
+    return await startProcess(supervisor, processName);
   } catch (e) {
     console.error('[Supervisor] Failed to restart process:', e.message);
     return false;
@@ -127,42 +334,59 @@ function restartProcess(supervisor, processName) {
  * @returns {Object} Status information
  */
 function getStatus(supervisor) {
-  if (!supervisor) {
-    return { available: false, error: 'Supervisor not initialized', processes: {} };
-  }
+  const registry = buildKnownServiceRegistry();
+  const processes = {};
+  let available = false;
+  let baseStatus = {};
 
   try {
-    if (typeof supervisor.getStatus === 'function') {
-      const status = supervisor.getStatus();
-      return { available: true, ...status };
+    if (supervisor && typeof supervisor.getStatus === 'function') {
+      baseStatus = supervisor.getStatus() || {};
+      available = true;
+      Object.assign(processes, baseStatus.processes || {});
+    } else if (supervisor?.processes && typeof supervisor.processes.forEach === 'function') {
+      available = true;
+      supervisor.processes.forEach((entry, name) => {
+        const uptime = entry.startTime && entry.status === 'running'
+          ? ((Date.now() - entry.startTime) / 1000).toFixed(2)
+          : null;
+        processes[name] = {
+          status: entry.status || 'unknown',
+          pid: entry.pid || null,
+          restarts: entry.restarts || 0,
+          uptime,
+          autoRestart: entry.config ? entry.config.autoRestart : undefined,
+        };
+      });
     }
-    // Fallback: build minimal status from known fields
-    const processes = {};
-    try {
-      if (supervisor.processes && typeof supervisor.processes.forEach === 'function') {
-        supervisor.processes.forEach((entry, name) => {
-          const uptime = entry.startTime && entry.status === 'running'
-            ? ((Date.now() - entry.startTime) / 1000).toFixed(2)
-            : null;
-          processes[name] = {
-            status: entry.status || 'unknown',
-            pid: entry.pid || null,
-            restarts: entry.restarts || 0,
-            uptime,
-            autoRestart: entry.config ? entry.config.autoRestart : undefined
-          };
-        });
-      }
-    } catch {}
-    return {
-      available: true,
-      supervisor: { config: supervisor.config || {} },
-      processes
-    };
   } catch (e) {
-    console.error('[Supervisor] Failed to get status:', e.message);
-    return { available: true, error: e.message, processes: {} };
+    console.error('[Supervisor] Failed to get base status:', e.message);
   }
+
+  for (const definition of Object.values(registry)) {
+    if (!definition.available) continue;
+    const existing = processes[definition.name] ? { ...processes[definition.name] } : {
+      status: 'registered',
+      pid: null,
+      restarts: 0,
+      uptime: null,
+      autoRestart: definition.autoRestart,
+    };
+    const pid = getListeningPid(definition.port);
+    if (pid) {
+      existing.status = 'running';
+      existing.pid = pid;
+      existing.source = existing.source || (isRegisteredInSupervisor(supervisor, definition.name) ? 'supervisor' : 'port-detect');
+    }
+    processes[definition.name] = existing;
+    available = true;
+  }
+
+  return {
+    available,
+    supervisor: baseStatus.supervisor || { config: supervisor?.config || {} },
+    processes,
+  };
 }
 
 /**
@@ -181,75 +405,10 @@ async function setupA11Supervisor() {
     return null;
   }
 
-  const BASE = path.resolve(__dirname, '..');
-  
-  // Service management flags from env
-  const manageCerbere = process.env.MANAGE_CERBERE !== 'false';
-  const manageTTS = process.env.MANAGE_TTS === 'true';
-  
-  // 1. Cerbère (LLM Router on port 4545)
-  if (manageCerbere) {
-    const cerbereScript = path.join(BASE, 'llm-router.mjs');
-    
-    if (fs.existsSync(cerbereScript)) {
-      // Skip registering Cerbère if port is already in use
-      const inUse = await isPortInUse(4545);
-      if (inUse) {
-        console.warn('[Supervisor] Detected Cerbère already running on 4545 — skipping supervision registration');
-      } else {
-        console.log('[Supervisor] ✓ Registering Cerbère (LLM Router) for supervision');
-        console.log('[Supervisor]   Script:', cerbereScript);
-        console.log('[Supervisor]   Port: 4545');
-        
-        registerProcess(supervisor, {
-          name: 'cerbere',
-          command: 'node',
-          args: [cerbereScript],
-          cwd: path.dirname(cerbereScript),
-          env: { 
-            PORT: '4545',
-            LLM_ROUTER_PORT: '4545'
-          },
-          autoRestart: true
-        });
-      }
-    } else {
-      console.error('[Supervisor] ✗ Cerbère script NOT FOUND at:', cerbereScript);
-    }
-  } else {
-    console.log('[Supervisor] Cerbère management disabled (MANAGE_CERBERE=false)');
-  }
-
-  // 2. TTS Service (Piper)
-  if (manageTTS) {
-    const ttsScript = findTTSScript();
-    const ttsPort = process.env.TTS_PORT || '5002';
-    
-    if (ttsScript) {
-      console.log('[Supervisor] ✓ Registering TTS Service for supervision');
-      console.log('[Supervisor]   Script:', ttsScript);
-      console.log('[Supervisor]   Port:', ttsPort);
-      
-      // Detect if Python or Node.js script
-      const isPython = ttsScript.endsWith('.py');
-      
-      registerProcess(supervisor, {
-        name: 'tts',
-        command: isPython ? 'python' : 'node',
-        args: [ttsScript],
-        cwd: path.dirname(ttsScript),
-        env: {
-          TTS_PORT: ttsPort,
-          PIPER_DIR: path.resolve(__dirname, '../../piper')
-        },
-        autoRestart: true
-      });
-    } else {
-      console.warn('[Supervisor] ✗ TTS script NOT FOUND (searched: serve.py, server.py, piper/serve.py)');
-      console.warn('[Supervisor]   Set MANAGE_TTS=false to disable or add TTS script to expected locations');
-    }
-  } else {
-    console.log('[Supervisor] TTS management disabled (MANAGE_TTS not set to true)');
+  const registry = buildKnownServiceRegistry();
+  for (const definition of Object.values(registry)) {
+    if (!definition.available) continue;
+    registerProcess(supervisor, definition);
   }
 
   return supervisor;
@@ -257,12 +416,14 @@ async function setupA11Supervisor() {
 
 // Helper functions
 
-function findTTSScript() {
+function findTTSScript(quiet = false) {
   const BASE = path.resolve(__dirname, '../..');
   const WORKSPACE_ROOT = path.resolve(BASE, '..', '..');
   const candidates = [
+    path.join(WORKSPACE_ROOT, 'apps', 'tts', 'siwis.py'),
     path.join(WORKSPACE_ROOT, 'apps', 'tts', 'serve.py'),
     path.join(WORKSPACE_ROOT, 'apps', 'tts', 'server.py'),
+    path.join(BASE, 'tts', 'siwis.py'),
     path.join(BASE, 'tts', 'serve.py'),
     path.join(BASE, 'tts', 'server.py'),
     path.join(BASE, 'piper', 'serve.py'),
@@ -271,7 +432,9 @@ function findTTSScript() {
   
   for (const script of candidates) {
     if (fs.existsSync(script)) {
-      console.log('[Supervisor] Found TTS script at:', script);
+      if (!quiet) {
+        console.log('[Supervisor] Found TTS script at:', script);
+      }
       return script;
     }
   }
@@ -308,14 +471,32 @@ async function initQflush(options = {}) {
  * @param {object} payload - Arguments for the flow
  * @returns {Promise<object>} Result of the flow
  */
-async function runQflushFlow(flow, payload) {
+function getQflushRemoteToken() {
+  return String(
+    process.env.NEZ_ADMIN_TOKEN ||
+    process.env.QFLUSH_TOKEN ||
+    process.env.NPZ_ADMIN_TOKEN ||
+    ''
+  ).trim();
+}
+
+async function runQflushFlow(flow, payload, options = {}) {
   const remoteUrl = process.env.QFLUSH_URL || process.env.QFLUSH_REMOTE_URL;
   if (remoteUrl) {
     // Use remote qflush service
     try {
-      const response = await fetch(`${remoteUrl}/run`, {
+      const remoteToken = getQflushRemoteToken();
+      const endpointPath = options.admin === true ? '/api/admin/run' : '/run';
+      const headers = {
+        'Content-Type': 'application/json',
+      };
+      if (remoteToken) {
+        headers['Authorization'] = `Bearer ${remoteToken}`;
+        headers['x-qflush-token'] = remoteToken;
+      }
+      const response = await fetch(`${String(remoteUrl).replace(/\/+$/, '')}${endpointPath}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ flow, payload })
       });
       if (!response.ok) {

@@ -2,13 +2,22 @@ const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const axios = require('axios');
+const AdmZip = require('adm-zip');
 const PDFDocument = require('pdfkit');
 const fsSync = require('node:fs');
-const { exec } = require('node:child_process');
+const { exec, spawn } = require('node:child_process');
+const { getShellToolName, isShellAllowed } = require('../../lib/safe-shell.cjs');
+const { analyzeUploadedResource } = require('../../lib/resource-reader.cjs');
+const {
+  resolveSdProxyUrl,
+  resolveSdScriptPath,
+  runSdScript,
+} = require('../../lib/sd-runtime.cjs');
 
 // ⚠️ IMPORTANT : importer le manifest AVANT d'utiliser WORKSPACE_ROOTS
 const { TOOL_MANIFEST, WORKSPACE_ROOTS, SAFE_DATA_ROOT } = require('./tools-manifest.cjs');
 const { runQflushFlow } = require('../qflush-integration.cjs');
+const { callA11Host, getA11HostStatus } = require('../../a11host.cjs');
 
 function resolveSafePath(p, label) {
   const raw = String(p || "").trim();
@@ -22,18 +31,781 @@ function resolveSafePath(p, label) {
   return target;
 }
 
+function isPathWithinRoot(targetPath, rootPath) {
+  const target = path.resolve(String(targetPath || ''));
+  const root = path.resolve(String(rootPath || ''));
+  const normalizedTarget = process.platform === 'win32' ? target.toLowerCase() : target;
+  const normalizedRoot = process.platform === 'win32' ? root.toLowerCase() : root;
+  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(normalizedRoot + path.sep);
+}
+
+function resolveManagedPath(p, label) {
+  const raw = String(p || '').trim();
+  if (!raw) throw new Error(`${label || 'path'}: empty path not allowed`);
+
+  if (!path.isAbsolute(raw)) {
+    return resolveSafePath(raw, label);
+  }
+
+  const absolute = path.resolve(raw);
+  const allowedRoots = [SAFE_DATA_ROOT, ...(Array.isArray(WORKSPACE_ROOTS) ? WORKSPACE_ROOTS : [])];
+  if (allowedRoots.some((root) => isPathWithinRoot(absolute, root))) {
+    return absolute;
+  }
+
+  throw new Error(`${label || 'path'}: path outside allowed roots`);
+}
+
 // ─────────────────────────────
 // Base mémoire JSON pour A-11
 // ─────────────────────────────
 
-// Workspace de base pour la mémoire (priorité au deuxième, sinon au premier, sinon D:\A12)
+// Workspace de base pour la mémoire.
 const DEFAULT_WORKSPACE_ROOT =
-  (Array.isArray(WORKSPACE_ROOTS) && (WORKSPACE_ROOTS[1] || WORKSPACE_ROOTS[0])) ||
-  'D:\\A12';
+  (Array.isArray(WORKSPACE_ROOTS) && WORKSPACE_ROOTS[0]) ||
+  process.cwd();
 
 // ⚠️ Renommé → A11_MEMORY_ROOT pour éviter tout conflit avec d'autres modules
 const A11_MEMORY_ROOT = path.resolve(DEFAULT_WORKSPACE_ROOT, 'a11_memory');
 const A11_MEMO_DIR = path.join(A11_MEMORY_ROOT, 'memos');
+
+function slugifyAssetSegment(value, fallback = 'asset') {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || fallback;
+}
+
+function buildGeneratedAssetPath(filename, label = 'generated.outputPath') {
+  return resolveSafePath(path.join('generated', filename), label);
+}
+
+function guessDownloadExtension(rawExt, contentType = '') {
+  const normalizedExt = String(rawExt || '').trim().toLowerCase();
+  if (/^\.[a-z0-9]{1,10}$/i.test(normalizedExt)) {
+    return normalizedExt;
+  }
+  const normalizedType = String(contentType || '').trim().toLowerCase().split(';')[0];
+  switch (normalizedType) {
+    case 'image/png':
+      return '.png';
+    case 'image/jpeg':
+      return '.jpg';
+    case 'image/gif':
+      return '.gif';
+    case 'image/webp':
+      return '.webp';
+    case 'application/pdf':
+      return '.pdf';
+    case 'text/plain':
+      return '.txt';
+    case 'text/markdown':
+      return '.md';
+    case 'application/json':
+    case 'text/json':
+      return '.json';
+    case 'audio/wav':
+    case 'audio/x-wav':
+      return '.wav';
+    default:
+      return '.bin';
+  }
+}
+
+function getInternalApiBaseUrl() {
+  const configured = String(process.env.A11_INTERNAL_API_BASE_URL || '').trim();
+  if (configured) return configured.replace(/\/+$/, '');
+  const port = String(process.env.PORT || 3000).trim() || '3000';
+  return `http://127.0.0.1:${port}`;
+}
+
+function getAuthTokenFromContext(context = {}) {
+  return String(context.authToken || context.token || '').trim();
+}
+
+function guessContentType(filePath) {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  switch (ext) {
+    case '.pdf':
+      return 'application/pdf';
+    case '.txt':
+    case '.md':
+      return 'text/plain; charset=utf-8';
+    case '.json':
+      return 'application/json';
+    case '.csv':
+      return 'text/csv; charset=utf-8';
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.gif':
+      return 'image/gif';
+    case '.webp':
+      return 'image/webp';
+    case '.docx':
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    case '.xlsx':
+      return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+function extractShareFileDownloadUrl(result = {}) {
+  return String(
+    result?.file?.downloadUrl
+    || result?.conversationResource?.downloadUrl
+    || ''
+  ).trim();
+}
+
+async function fetchInternalJson(pathname, options = {}, context = {}) {
+  const authToken = getAuthTokenFromContext(context);
+  if (!authToken) {
+    throw new Error(`${pathname}: authenticated user context required`);
+  }
+
+  const url = `${getInternalApiBaseUrl()}${pathname}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-NEZ-TOKEN': authToken,
+    ...(options.headers || {}),
+  };
+
+  const res = await fetch(url, {
+    method: options.method || 'GET',
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+
+  const data = await res.json().catch(async () => ({
+    ok: false,
+    error: await res.text().catch(() => 'invalid_response'),
+  }));
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      ...(data && typeof data === 'object' ? data : { error: String(data) }),
+    };
+  }
+
+  return data;
+}
+
+async function fetchInternalBuffer(pathname, options = {}, context = {}) {
+  const authToken = getAuthTokenFromContext(context);
+  if (!authToken) {
+    throw new Error(`${pathname}: authenticated user context required`);
+  }
+
+  const url = `${getInternalApiBaseUrl()}${pathname}`;
+  const headers = {
+    'X-NEZ-TOKEN': authToken,
+    ...(options.headers || {}),
+  };
+
+  const res = await fetch(url, {
+    method: options.method || 'GET',
+    headers,
+  });
+
+  const arrayBuffer = await res.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      error: buffer.toString('utf8') || `${pathname}: request_failed`,
+    };
+  }
+
+  return {
+    ok: true,
+    status: res.status,
+    buffer,
+    contentType: String(res.headers.get('content-type') || '').trim(),
+    contentLength: Number(res.headers.get('content-length') || buffer.length || 0),
+  };
+}
+
+function listAttachmentPaths(args = {}) {
+  const items = [];
+  if (typeof args.path === 'string' && args.path.trim()) items.push(args.path);
+  if (typeof args.attachmentPath === 'string' && args.attachmentPath.trim()) items.push(args.attachmentPath);
+  if (typeof args.filePath === 'string' && args.filePath.trim()) items.push(args.filePath);
+  if (typeof args.outputPath === 'string' && args.outputPath.trim()) items.push(args.outputPath);
+  if (Array.isArray(args.paths)) items.push(...args.paths);
+  if (Array.isArray(args.attachments)) {
+    for (const item of args.attachments) {
+      if (typeof item === 'string' && item.trim()) items.push(item);
+      else if (item && typeof item === 'object' && typeof item.path === 'string' && item.path.trim()) items.push(item.path);
+    }
+  }
+  return Array.from(new Set(items.map((item) => String(item || '').trim()).filter(Boolean)));
+}
+
+function buildResourceRefCandidates(ref) {
+  const raw = String(ref || '').trim();
+  if (!raw) return [];
+
+  const filename = path.basename(raw);
+  const noQuery = filename.split('?')[0].split('#')[0];
+  const stem = noQuery.replace(/\.[^.]+$/, '');
+  const normalized = [raw, filename, noQuery, stem]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+
+  return Array.from(new Set(normalized));
+}
+
+function isLikelyImageResource(resource) {
+  const contentType = String(resource?.contentType || '').toLowerCase();
+  if (contentType.startsWith('image/')) return true;
+  const filename = String(resource?.filename || '').toLowerCase();
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(filename);
+}
+
+function scoreConversationResourceMatch(resource, candidates) {
+  const id = Number(resource?.id || 0);
+  const filename = String(resource?.filename || '').trim().toLowerCase();
+  const url = String(resource?.url || '').trim().toLowerCase();
+  const stem = filename.replace(/\.[^.]+$/, '');
+  let score = 0;
+
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '').trim().toLowerCase();
+    if (!normalized) continue;
+    if (Number.isFinite(id) && id > 0 && normalized === String(id)) score = Math.max(score, 120);
+    if (normalized === filename) score = Math.max(score, 110);
+    if (normalized === path.basename(filename)) score = Math.max(score, 105);
+    if (normalized === stem) score = Math.max(score, 95);
+    if (filename.includes(normalized)) score = Math.max(score, 72);
+    if (url && (url === normalized || url.includes(normalized))) score = Math.max(score, 68);
+  }
+
+  if (isLikelyImageResource(resource)) score += 12;
+  return score;
+}
+
+async function listConversationResourcesForContext(options = {}) {
+  const context = options.context || {};
+  const cache = options.resourceCache && typeof options.resourceCache === 'object' ? options.resourceCache : null;
+  if (cache?.resourcesPromise) return cache.resourcesPromise;
+
+  const conversationId = String(
+    options.conversationId ||
+    context.conversationId ||
+    context.convId ||
+    context.sessionId ||
+    ''
+  ).trim();
+  if (!conversationId) return [];
+
+  const search = new URLSearchParams();
+  search.set('conversationId', conversationId);
+  search.set('limit', String(Math.max(10, Math.min(60, Number(options.limit || 40)))));
+
+  const promise = fetchInternalJson(`/api/resources/my?${search.toString()}`, {
+    method: 'GET',
+  }, context)
+    .then((result) => (result?.ok && Array.isArray(result.resources) ? result.resources : []))
+    .catch(() => []);
+
+  if (cache) cache.resourcesPromise = promise;
+  return promise;
+}
+
+async function resolveStoredConversationResource(ref, options = {}) {
+  const rawRef = String(ref || '').trim();
+  if (!rawRef) return null;
+
+  const cache = options.resourceCache && typeof options.resourceCache === 'object' ? options.resourceCache : null;
+  if (cache?.resolvedByRef instanceof Map && cache.resolvedByRef.has(rawRef)) {
+    return cache.resolvedByRef.get(rawRef) || null;
+  }
+
+  const candidates = buildResourceRefCandidates(rawRef);
+  if (!candidates.length) return null;
+
+  const resources = await listConversationResourcesForContext(options);
+  if (!resources.length) {
+    if (cache?.resolvedByRef instanceof Map) cache.resolvedByRef.set(rawRef, null);
+    return null;
+  }
+
+  let best = null;
+  let bestScore = 0;
+  for (const resource of resources) {
+    const score = scoreConversationResourceMatch(resource, candidates);
+    if (score > bestScore) {
+      best = resource;
+      bestScore = score;
+    }
+  }
+
+  const selected = bestScore >= 68 ? best : null;
+  if (cache?.resolvedByRef instanceof Map) cache.resolvedByRef.set(rawRef, selected);
+  return selected;
+}
+
+async function listStoredFilesForContext(options = {}) {
+  const context = options.context || {};
+  const cache = options.resourceCache && typeof options.resourceCache === 'object' ? options.resourceCache : null;
+  if (cache?.storedFilesPromise) return cache.storedFilesPromise;
+
+  const limit = Math.max(10, Math.min(80, Number(options.limit || 50)));
+  const promise = fetchInternalJson(`/api/files/my?limit=${limit}`, {
+    method: 'GET',
+  }, context)
+    .then((result) => (result?.ok && Array.isArray(result.files) ? result.files : []))
+    .catch(() => []);
+
+  if (cache) cache.storedFilesPromise = promise;
+  return promise;
+}
+
+async function resolveStoredUserFile(ref, options = {}) {
+  const rawRef = String(ref || '').trim();
+  if (!rawRef) return null;
+
+  const cache = options.resourceCache && typeof options.resourceCache === 'object' ? options.resourceCache : null;
+  if (cache?.resolvedStoredFilesByRef instanceof Map && cache.resolvedStoredFilesByRef.has(rawRef)) {
+    return cache.resolvedStoredFilesByRef.get(rawRef) || null;
+  }
+
+  const candidates = buildResourceRefCandidates(rawRef);
+  if (!candidates.length) return null;
+
+  const files = await listStoredFilesForContext(options);
+  if (!files.length) {
+    if (cache?.resolvedStoredFilesByRef instanceof Map) cache.resolvedStoredFilesByRef.set(rawRef, null);
+    return null;
+  }
+
+  let best = null;
+  let bestScore = 0;
+  for (const file of files) {
+    const score = scoreConversationResourceMatch({
+      id: file?.id,
+      filename: file?.filename,
+      url: file?.url,
+      contentType: file?.content_type || file?.contentType,
+    }, candidates);
+    if (score > bestScore) {
+      best = file;
+      bestScore = score;
+    }
+  }
+
+  const selected = bestScore >= 68 ? best : null;
+  if (cache?.resolvedStoredFilesByRef instanceof Map) cache.resolvedStoredFilesByRef.set(rawRef, selected);
+  return selected;
+}
+
+function isImageLikeContentType(value) {
+  return String(value || '').trim().toLowerCase().startsWith('image/');
+}
+
+function isImageLikeFilename(value) {
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(String(value || '').trim());
+}
+
+function getExistingResourceAnalysis(resource) {
+  const metadata = resource?.metadata && typeof resource.metadata === 'object' ? resource.metadata : null;
+  const analysis = metadata?.analysis && typeof metadata.analysis === 'object' ? metadata.analysis : null;
+  return analysis || null;
+}
+
+async function findLatestImageConversationResource(options = {}) {
+  const resources = await listConversationResourcesForContext({
+    ...options,
+    limit: Math.max(12, Number(options.limit || 24)),
+  });
+  if (!Array.isArray(resources) || !resources.length) return null;
+  return resources.find((resource) => {
+    const analysis = getExistingResourceAnalysis(resource);
+    return isImageLikeContentType(resource?.contentType)
+      || isImageLikeFilename(resource?.filename)
+      || isImageLikeContentType(analysis?.mime)
+      || isImageLikeFilename(resource?.url);
+  }) || null;
+}
+
+async function loadConversationResourceBuffer(resource, context = {}) {
+  const resourceId = Number(resource?.id || 0);
+  if (!Number.isFinite(resourceId) || resourceId <= 0) return null;
+  const downloaded = await fetchInternalBuffer(`/api/resources/${resourceId}/download`, {
+    method: 'GET',
+  }, context);
+  if (!downloaded?.ok || !downloaded.buffer) {
+    throw new Error(downloaded?.error || downloaded?.message || 'resource_download_failed');
+  }
+  return {
+    buffer: downloaded.buffer,
+    filename: String(resource?.filename || `resource-${resourceId}.bin`).trim(),
+    contentType: String(downloaded.contentType || resource?.contentType || '').trim() || 'application/octet-stream',
+    source: 'conversation_resource',
+    resourceId,
+    resource,
+  };
+}
+
+async function resolveVisionImageSource(args = {}, options = {}) {
+  const context = options.context || {};
+  const conversationId = String(
+    options.conversationId ||
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    ''
+  ).trim();
+  const resourceCache = options.resourceCache && typeof options.resourceCache === 'object'
+    ? options.resourceCache
+    : {
+        resolvedByRef: new Map(),
+        resolvedStoredFilesByRef: new Map(),
+        resourcesPromise: null,
+        storedFilesPromise: null,
+      };
+  const explicitRef = String(
+    args.path ||
+    args.imagePath ||
+    args.filePath ||
+    args.resourceRef ||
+    args.ref ||
+    args.url ||
+    ''
+  ).trim();
+  const requestedResourceId = Number(args.resourceId || args.resource_id || args.id || 0);
+
+  if (Number.isFinite(requestedResourceId) && requestedResourceId > 0) {
+    const resources = await listConversationResourcesForContext({
+      context,
+      conversationId,
+      resourceCache,
+      limit: 60,
+    });
+    const matched = resources.find((entry) => Number(entry?.id || 0) === requestedResourceId) || null;
+    if (!matched) {
+      throw new Error(`vision_analyze: resource ${requestedResourceId} introuvable`);
+    }
+    return loadConversationResourceBuffer(matched, context);
+  }
+
+  if (explicitRef) {
+    const matchedResource = await resolveStoredConversationResource(explicitRef, {
+      context,
+      conversationId,
+      resourceCache,
+      limit: 60,
+    }).catch(() => null);
+    if (matchedResource) {
+      return loadConversationResourceBuffer(matchedResource, context);
+    }
+
+    const matchedFile = await resolveStoredUserFile(explicitRef, {
+      context,
+      conversationId,
+      resourceCache,
+      limit: 60,
+    }).catch(() => null);
+    if (matchedFile?.url) {
+      const response = await fetch(String(matchedFile.url));
+      if (!response.ok) {
+        throw new Error(`vision_analyze: impossible de recuperer ${matchedFile.url} (${response.status})`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return {
+        buffer,
+        filename: String(matchedFile.filename || path.basename(explicitRef) || 'image').trim(),
+        contentType: String(matchedFile.content_type || matchedFile.contentType || guessContentType(matchedFile.filename || explicitRef)).trim(),
+        source: 'stored_file',
+        file: matchedFile,
+      };
+    }
+
+    if (/^https?:\/\//i.test(explicitRef)) {
+      const response = await fetch(explicitRef);
+      if (!response.ok) {
+        throw new Error(`vision_analyze: impossible de recuperer ${explicitRef} (${response.status})`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return {
+        buffer,
+        filename: path.basename(new URL(explicitRef).pathname || 'image'),
+        contentType: String(response.headers.get('content-type') || '').trim() || 'application/octet-stream',
+        source: 'remote_url',
+        url: explicitRef,
+      };
+    }
+
+    const localPath = resolveManagedPath(explicitRef, 'vision_analyze.path');
+    if (!fsSync.existsSync(localPath)) {
+      throw new Error(`vision_analyze: image introuvable (${localPath})`);
+    }
+    const stats = fsSync.statSync(localPath);
+    if (!stats.isFile()) {
+      throw new Error(`vision_analyze: le chemin n'est pas un fichier (${localPath})`);
+    }
+    return {
+      buffer: await fsp.readFile(localPath),
+      filename: path.basename(localPath),
+      contentType: guessContentType(localPath),
+      source: 'local_path',
+      path: localPath,
+    };
+  }
+
+  const latestImage = await findLatestImageConversationResource({
+    context,
+    conversationId,
+    resourceCache,
+    limit: 40,
+  });
+  if (!latestImage) {
+    throw new Error('vision_analyze: aucune image recente trouvee dans cette conversation');
+  }
+  return loadConversationResourceBuffer(latestImage, context);
+}
+
+function extractVisionTextContent(value) {
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => {
+        if (typeof entry === 'string') return entry.trim();
+        if (entry && typeof entry === 'object' && entry.type === 'text') {
+          return String(entry.text || '').trim();
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+  return '';
+}
+
+async function describeImageWithRemoteVision(source, args = {}) {
+  const apiKey = String(
+    args.apiKey ||
+    process.env.A11_VISION_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    ''
+  ).trim();
+  const baseUrl = String(
+    args.baseUrl ||
+    process.env.A11_VISION_BASE_URL ||
+    process.env.A11_OPENAI_BASE_URL ||
+    process.env.OPENAI_BASE_URL ||
+    ''
+  ).trim();
+  const model = String(
+    args.model ||
+    process.env.A11_VISION_MODEL ||
+    process.env.OPENAI_VISION_MODEL ||
+    process.env.OPENAI_MODEL ||
+    'gpt-4o-mini'
+  ).trim();
+
+  if (!apiKey || !baseUrl || !Buffer.isBuffer(source?.buffer) || !source.buffer.length) {
+    return null;
+  }
+
+  const normalizedBase = baseUrl.replace(/\/+$/, '');
+  const url = normalizedBase.endsWith('/v1')
+    ? `${normalizedBase}/chat/completions`
+    : `${normalizedBase}/v1/chat/completions`;
+  const task = String(args.task || 'describe').trim().toLowerCase();
+  const prompt = task === 'ocr'
+    ? "Lis tout le texte visible dans l'image. Si aucun texte n'est visible, dis-le clairement."
+    : "Decris tres brievement ce qui est visible dans cette image, sans inventer. Si le contenu est incertain, dis-le.";
+  const dataUrl = `data:${String(source.contentType || 'image/png').trim() || 'image/png'};base64,${source.buffer.toString('base64')}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: 'system',
+          content: 'Tu es un module de vision pour A11. Reponds en francais, en 1 ou 2 phrases courtes maximum, sans inventer.',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: dataUrl } },
+          ],
+        },
+      ],
+      max_tokens: 220,
+      stream: false,
+    }),
+  });
+
+  const rawText = await response.text();
+  if (!response.ok) {
+    throw new Error(`vision_remote_failed:${response.status}:${rawText.slice(0, 240)}`);
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    return rawText.trim();
+  }
+
+  return extractVisionTextContent(parsed?.choices?.[0]?.message?.content || parsed?.output_text || '');
+}
+
+function buildVisionSummary(source, analysis, remoteDescription, task = '') {
+  const normalizedTask = String(task || '').trim().toLowerCase();
+  if (remoteDescription) return remoteDescription;
+  if (analysis?.readableInChatContext && analysis.preview) {
+    return normalizedTask === 'ocr'
+      ? `J'ai pu lire ce texte dans l'image : ${String(analysis.preview).trim()}`
+      : `Je peux au moins lire ceci dans l'image : ${String(analysis.preview).trim()}`;
+  }
+
+  const format = String(analysis?.format || source?.contentType || 'image').trim();
+  const width = Number(analysis?.width || 0) || null;
+  const height = Number(analysis?.height || 0) || null;
+  const dimensions = width && height ? ` (${width}x${height})` : '';
+  return `Je peux confirmer que c'est une image ${format}${dimensions}, mais aucun modele vision n'est configure ici pour decrire son contenu visuel avec fiabilite.`;
+}
+
+function normalizeRecipientsInput(value) {
+  if (Array.isArray(value)) {
+    return Array.from(new Set(
+      value
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+    ));
+  }
+
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  return Array.from(new Set(
+    raw
+      .split(/[;,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  ));
+}
+
+function buildAttachmentPayload(fullPath, index = 0, forcedFilename = '') {
+  if (!fsSync.existsSync(fullPath)) {
+    throw new Error(`attachment file not found: ${fullPath}`);
+  }
+  const stats = fsSync.statSync(fullPath);
+  if (!stats.isFile()) {
+    throw new Error(`attachment path is not a file: ${fullPath}`);
+  }
+  const buffer = fsSync.readFileSync(fullPath);
+  return {
+    filename: forcedFilename && index === 0 ? String(forcedFilename).trim() : path.basename(fullPath),
+    contentBase64: buffer.toString('base64'),
+    contentType: guessContentType(fullPath),
+    sizeBytes: stats.size,
+  };
+}
+
+function buildDownloadedAssetPath(sourceUrl, label = 'download_file.path', contentType = '') {
+  const fallbackName = `download-${Date.now()}.bin`;
+  let filename = fallbackName;
+  try {
+    const parsed = new URL(String(sourceUrl || ''));
+    const rawName = path.basename(parsed.pathname || '') || '';
+    const ext = path.extname(rawName).toLowerCase();
+    const baseName = path.basename(rawName, ext);
+    const safeBase = slugifyAssetSegment(baseName || 'download', 'download');
+    const safeExt = guessDownloadExtension(ext, contentType);
+    filename = `${safeBase}-${Date.now()}${safeExt}`;
+  } catch {
+    filename = fallbackName;
+  }
+  return resolveSafePath(path.join('downloads', filename), label);
+}
+
+async function resolveWriteTarget(filePath, options = {}) {
+  const {
+    overwrite = false,
+    content = '',
+    encoding = 'utf8',
+  } = options;
+
+  if (overwrite || !fsSync.existsSync(filePath)) {
+    return {
+      path: filePath,
+      requestedPath: filePath,
+      collisionResolved: false,
+      reusedExisting: false,
+    };
+  }
+
+  try {
+    const existingBuffer = await fsp.readFile(filePath);
+    const incomingBuffer = Buffer.isBuffer(content)
+      ? content
+      : Buffer.from(String(content ?? ''), encoding);
+    if (Buffer.compare(existingBuffer, incomingBuffer) === 0) {
+      return {
+        path: filePath,
+        requestedPath: filePath,
+        collisionResolved: false,
+        reusedExisting: true,
+      };
+    }
+  } catch {
+    // ignore comparison issues and fall through to path suffixing
+  }
+
+  const dir = path.dirname(filePath);
+  const ext = path.extname(filePath);
+  const baseName = path.basename(filePath, ext);
+  for (let index = 2; index <= 9999; index += 1) {
+    const candidate = path.join(dir, `${baseName}-${index}${ext}`);
+    if (!fsSync.existsSync(candidate)) {
+      return {
+        path: candidate,
+        requestedPath: filePath,
+        collisionResolved: true,
+        reusedExisting: false,
+      };
+    }
+  }
+
+  const fallback = path.join(dir, `${baseName}-${Date.now()}${ext}`);
+  return {
+    path: fallback,
+    requestedPath: filePath,
+    collisionResolved: true,
+    reusedExisting: false,
+  };
+}
+
+function parseImageSize(value, fallbackWidth = 1024, fallbackHeight = 1024) {
+  const raw = String(value || '').trim().toLowerCase();
+  const match = /^(\d{2,4})\s*[xX]\s*(\d{2,4})$/.exec(raw);
+  if (!match) {
+    return { width: fallbackWidth, height: fallbackHeight };
+  }
+  const width = Math.max(64, Math.min(2048, Number(match[1]) || fallbackWidth));
+  const height = Math.max(64, Math.min(2048, Number(match[2]) || fallbackHeight));
+  return { width, height };
+}
 
 function ensureMemoDir() {
   try {
@@ -103,7 +875,6 @@ async function saveFacts(obj) {
 
 async function t_download_file(args = {}) {
   const { url } = args;
-  const filePath = resolveSafePath(args.path || args.outputPath, "download_file.path");
 
   if (!url || typeof url !== 'string') {
     throw new Error('download_file: missing "url"');
@@ -120,7 +891,7 @@ async function t_download_file(args = {}) {
     return {
       ok: false,
       url,
-      outputPath: filePath || null,
+      outputPath: null,
       error: 'invalid_dummy_url',
       message:
         'download_file: refused dummy URL (example.com / dummy / about:blank / data:). ' +
@@ -128,20 +899,9 @@ async function t_download_file(args = {}) {
     };
   }
 
-  // 🔒 N'accepte que des extensions d'image directes
-  function looksLikeImageUrl(url) {
-    return /\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(url.split('?')[0]);
-  }
-  if (!looksLikeImageUrl(url)) {
-    return {
-      ok: false,
-      url,
-      outputPath: filePath || null,
-      error: 'invalid_extension',
-      message:
-        'download_file: URL must point to a direct image file (.png, .jpg, .jpeg, .gif, .webp).'
-    };
-  }
+  const explicitOutputPath = args.path || args.outputPath
+    ? resolveSafePath(args.path || args.outputPath, 'download_file.path')
+    : null;
 
   let response;
   try {
@@ -156,7 +916,7 @@ async function t_download_file(args = {}) {
     return {
       ok: false,
       url,
-      outputPath: filePath,
+      outputPath: explicitOutputPath,
       error: String(e && e.message)
     };
   }
@@ -165,47 +925,524 @@ async function t_download_file(args = {}) {
     return {
       ok: false,
       url,
-      outputPath: filePath,
+      outputPath: explicitOutputPath,
       status: response.status,
       error: `HTTP ${response.status}`
     };
   }
 
   // 🔒 Vérifie le content-type
-  const contentType = response.headers['content-type'] || '';
-  if (!contentType.startsWith('image/')) {
+  const contentType = String(response.headers['content-type'] || '').toLowerCase();
+  if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml')) {
     return {
       ok: false,
       url,
-      outputPath: filePath,
-      error: 'not_image_content_type',
-      message: `download_file: Content-Type is not image/* (${contentType})`
+      outputPath: explicitOutputPath,
+      error: 'html_content_type_not_supported',
+      message: `download_file: HTML page responses are not supported (${contentType})`
     };
   }
 
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, response.data);
+  const requestedPath = explicitOutputPath || buildDownloadedAssetPath(url, 'download_file.path', contentType);
+  const writeTarget = await resolveWriteTarget(requestedPath, {
+    overwrite: args.overwrite === true,
+    content: Buffer.from(response.data),
+  });
 
-  // --- Validation post-download (anti-placeholder/erreur) ---
-  let sharp, stat, meta;
-  try {
-    sharp = require('sharp');
-    stat = await fsp.stat(filePath);
-    if (stat.size < 8000) {
-      return { ok: false, error: "BAD_IMAGE_TOO_SMALL", path: filePath };
-    }
-    meta = await sharp(filePath).metadata();
-    if (!meta.width || !meta.height) {
-      return { ok: false, error: "BAD_IMAGE_NO_METADATA", path: filePath };
-    }
-    if (meta.width < 350 && meta.height < 350) {
-      return { ok: false, error: "BAD_IMAGE_PLACEHOLDER_DIMENSIONS", path: filePath, meta };
-    }
-  } catch (e) {
-    return { ok: false, error: "BAD_IMAGE_VALIDATION_FAILED", details: e?.message, path: filePath };
+  await fsp.mkdir(path.dirname(writeTarget.path), { recursive: true });
+  if (!writeTarget.reusedExisting) {
+    await fsp.writeFile(writeTarget.path, response.data);
   }
 
-  return { ok: true, url, outputPath: filePath, meta };
+  let stat;
+  try {
+    stat = await fsp.stat(writeTarget.path);
+  } catch (e) {
+    return {
+      ok: false,
+      error: 'download_stat_failed',
+      details: e?.message,
+      path: writeTarget.path,
+      requestedPath: writeTarget.requestedPath,
+    };
+  }
+
+  let meta = null;
+  if (contentType.startsWith('image/')) {
+    try {
+      const sharp = require('sharp');
+      if (stat.size < 8000) {
+        return { ok: false, error: "BAD_IMAGE_TOO_SMALL", path: writeTarget.path };
+      }
+      meta = await sharp(writeTarget.path).metadata();
+      if (!meta.width || !meta.height) {
+        return { ok: false, error: "BAD_IMAGE_NO_METADATA", path: writeTarget.path };
+      }
+      if (meta.width < 350 && meta.height < 350) {
+        return { ok: false, error: "BAD_IMAGE_PLACEHOLDER_DIMENSIONS", path: writeTarget.path, meta };
+      }
+    } catch (e) {
+      return { ok: false, error: "BAD_IMAGE_VALIDATION_FAILED", details: e?.message, path: writeTarget.path };
+    }
+  }
+
+  return {
+    ok: true,
+    url,
+    outputPath: writeTarget.path,
+    requestedPath: writeTarget.requestedPath,
+    collisionResolved: writeTarget.collisionResolved,
+    reusedExisting: writeTarget.reusedExisting,
+    contentType,
+    size: stat.size,
+    meta,
+  };
+}
+
+async function t_share_file(args = {}) {
+  const context = args._context || {};
+  const fullPath = resolveManagedPath(args.path || args.outputPath || args.filePath, 'share_file.path');
+  if (!fsSync.existsSync(fullPath)) {
+    return { ok: false, error: 'File not found', path: fullPath };
+  }
+
+  const stats = fsSync.statSync(fullPath);
+  if (!stats.isFile()) {
+    return { ok: false, error: 'Path is not a file', path: fullPath };
+  }
+
+  const buffer = fsSync.readFileSync(fullPath);
+  const recipients = normalizeRecipientsInput(args.emailTo || args.to || args.email || args.recipient || args.recipients || '');
+  const attachToEmail = recipients.length
+    ? args.attachToEmail !== false && args.asAttachment !== false
+    : (args.attachToEmail === true || args.asAttachment === true);
+  const conversationId = String(
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    context.convId ||
+    context.sessionId ||
+    ''
+  ).trim();
+  const payload = {
+    filename: args.filename || path.basename(fullPath),
+    contentBase64: buffer.toString('base64'),
+    contentType: args.contentType || guessContentType(fullPath),
+    conversationId: conversationId || null,
+    emailTo: recipients.length ? recipients : '',
+    emailSubject: args.emailSubject || args.subject || '',
+    emailMessage: args.emailMessage || args.message || args.body || args.text || '',
+    attachToEmail,
+    ttlSeconds: Number.isFinite(Number(args.ttlSeconds)) && Number(args.ttlSeconds) > 0
+      ? Number(args.ttlSeconds)
+      : 3600,
+  };
+
+  const result = await fetchInternalJson('/api/files/upload', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) {
+    const publicDownloadUrl = extractShareFileDownloadUrl(result);
+    if (!publicDownloadUrl) {
+      return {
+        ok: false,
+        path: fullPath,
+        error: 'public_download_url_missing',
+        detail: result,
+      };
+    }
+    return {
+      ok: true,
+      path: fullPath,
+      file: result.file || null,
+      mail: result.mail || null,
+      record: result.record || null,
+      conversationResource: result.conversationResource || null,
+      url: publicDownloadUrl,
+      expiresAt: result?.file?.expiresAt || result?.conversationResource?.expiresAt || null,
+    };
+  }
+
+  const errorCode = String(result?.error || result?.message || '').trim();
+  const storageLikelyFailed = /r2_|upload_failed|signature|storage|public_download_url_missing/i.test(errorCode)
+    || /signature/i.test(String(result?.detail?.message || result?.detail?.error || ''));
+  if (recipients.length && storageLikelyFailed) {
+    const mailFallback = await t_send_email({
+      ...args,
+      to: recipients,
+      path: fullPath,
+      filename: payload.filename,
+      attachToEmail: true,
+      _context: context,
+      conversationId: conversationId || null,
+    });
+
+    if (mailFallback?.ok) {
+      return {
+        ok: true,
+        path: fullPath,
+        file: null,
+        mail: mailFallback.mail || null,
+        record: null,
+        conversationResource: null,
+        url: '',
+        expiresAt: null,
+        mailOnly: true,
+        storageFallbackReason: errorCode || 'storage_failed',
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    path: fullPath,
+    error: result?.error || result?.message || 'share_file_failed',
+    detail: result,
+  };
+}
+
+async function t_list_stored_files(args = {}) {
+  const context = args._context || {};
+  const limit = Number.isFinite(Number(args.limit))
+    ? Math.max(1, Math.min(100, Number(args.limit)))
+    : 20;
+  const result = await fetchInternalJson(`/api/files/my?limit=${limit}`, {
+    method: 'GET',
+  }, context);
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'list_stored_files_failed',
+    detail: result,
+  };
+}
+
+async function t_list_resources(args = {}) {
+  const context = args._context || {};
+  const limit = Number.isFinite(Number(args.limit))
+    ? Math.max(1, Math.min(100, Number(args.limit)))
+    : 20;
+  const search = new URLSearchParams();
+  search.set('limit', String(limit));
+  if (String(args.conversationId || args.convId || args.sessionId || '').trim()) {
+    search.set('conversationId', String(args.conversationId || args.convId || args.sessionId).trim());
+  }
+  if (String(args.kind || args.resourceKind || '').trim()) {
+    search.set('kind', String(args.kind || args.resourceKind).trim());
+  }
+
+  const result = await fetchInternalJson(`/api/resources/my?${search.toString()}`, {
+    method: 'GET',
+  }, context);
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'list_resources_failed',
+    detail: result,
+  };
+}
+
+async function t_email_resource(args = {}) {
+  const context = args._context || {};
+  const resourceId = Number(args.resourceId || args.resource_id || args.id || args.conversationResourceId || 0);
+  if (!Number.isFinite(resourceId) || resourceId <= 0) {
+    throw new Error('email_resource: missing valid "resourceId"');
+  }
+
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('email_resource: missing "to"');
+  }
+
+  const payload = {
+    resourceId,
+    to: recipients,
+    subject: args.subject || args.emailSubject || '',
+    message: args.message || args.emailMessage || args.body || args.text || '',
+    attachToEmail: args.attachToEmail === true || args.asAttachment === true || args.attach === true,
+  };
+
+  const result = await fetchInternalJson('/api/resources/email', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      resourceId,
+      to: recipients,
+      mail: result.mail || null,
+      resource: result.resource || null,
+    };
+  }
+
+  return {
+    ok: false,
+    resourceId,
+    to: recipients,
+    error: result?.error || result?.message || 'email_resource_failed',
+    detail: result,
+  };
+}
+
+async function t_get_latest_resource(args = {}) {
+  const context = args._context || {};
+  const search = new URLSearchParams();
+  if (String(args.conversationId || args.convId || args.sessionId || '').trim()) {
+    search.set('conversationId', String(args.conversationId || args.convId || args.sessionId).trim());
+  }
+  if (String(args.kind || args.resourceKind || '').trim()) {
+    search.set('kind', String(args.kind || args.resourceKind).trim());
+  }
+
+  const suffix = search.toString() ? `?${search.toString()}` : '';
+  const result = await fetchInternalJson(`/api/resources/latest${suffix}`, {
+    method: 'GET',
+  }, context);
+
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'get_latest_resource_failed',
+    detail: result,
+  };
+}
+
+async function t_email_latest_resource(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('email_latest_resource: missing "to"');
+  }
+
+  const payload = {
+    conversationId: args.conversationId || args.convId || args.sessionId || null,
+    kind: args.kind || args.resourceKind || '',
+    to: recipients,
+    subject: args.subject || args.emailSubject || '',
+    message: args.message || args.emailMessage || args.body || args.text || '',
+    attachToEmail: args.attachToEmail === true || args.asAttachment === true || args.attach === true,
+  };
+
+  const result = await fetchInternalJson('/api/resources/latest/email', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      to: recipients,
+      mail: result.mail || null,
+      resource: result.resource || null,
+      latest: true,
+    };
+  }
+
+  return {
+    ok: false,
+    to: recipients,
+    error: result?.error || result?.message || 'email_latest_resource_failed',
+    detail: result,
+  };
+}
+
+async function t_schedule_email(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('schedule_email: missing "to"');
+  }
+
+  const attachmentPaths = args.attachToEmail !== false ? listAttachmentPaths(args) : [];
+  const attachments = attachmentPaths.map((candidate, index) => {
+    const fullPath = resolveManagedPath(candidate, `schedule_email.path[${index}]`);
+    return buildAttachmentPayload(fullPath, index, args.filename || '');
+  });
+
+  const payload = {
+    kind: 'email',
+    to: recipients,
+    subject: args.subject || args.emailSubject || 'A11',
+    message: args.message || args.emailMessage || args.body || args.text || args.content || '',
+    html: args.html || '',
+    conversationId: args.conversationId || args.convId || args.sessionId || null,
+    sendAt: args.sendAt || args.when || '',
+    delaySeconds: args.delaySeconds || args.delay || args.inSeconds || null,
+    delayMinutes: args.delayMinutes || args.inMinutes || null,
+    attachments,
+  };
+
+  const result = await fetchInternalJson('/api/mail/schedule', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'schedule_email_failed',
+    detail: result,
+  };
+}
+
+async function t_schedule_resource_email(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('schedule_resource_email: missing "to"');
+  }
+
+  const resourceId = Number(args.resourceId || args.resource_id || args.id || args.conversationResourceId || 0);
+  if (!Number.isFinite(resourceId) || resourceId <= 0) {
+    throw new Error('schedule_resource_email: missing valid "resourceId"');
+  }
+
+  const result = await fetchInternalJson('/api/mail/schedule', {
+    method: 'POST',
+    body: {
+      kind: 'resource_email',
+      resourceId,
+      to: recipients,
+      subject: args.subject || args.emailSubject || '',
+      message: args.message || args.emailMessage || args.body || args.text || '',
+      conversationId: args.conversationId || args.convId || args.sessionId || null,
+      sendAt: args.sendAt || args.when || '',
+      delaySeconds: args.delaySeconds || args.delay || args.inSeconds || null,
+      delayMinutes: args.delayMinutes || args.inMinutes || null,
+      attachToEmail: args.attachToEmail === true || args.asAttachment === true || args.attach === true,
+    },
+  }, context);
+
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'schedule_resource_email_failed',
+    detail: result,
+  };
+}
+
+async function t_schedule_latest_resource_email(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('schedule_latest_resource_email: missing "to"');
+  }
+
+  const result = await fetchInternalJson('/api/mail/schedule', {
+    method: 'POST',
+    body: {
+      kind: 'latest_resource_email',
+      to: recipients,
+      subject: args.subject || args.emailSubject || '',
+      message: args.message || args.emailMessage || args.body || args.text || '',
+      conversationId: args.conversationId || args.convId || args.sessionId || null,
+      kindFilter: args.kind || args.resourceKind || '',
+      sendAt: args.sendAt || args.when || '',
+      delaySeconds: args.delaySeconds || args.delay || args.inSeconds || null,
+      delayMinutes: args.delayMinutes || args.inMinutes || null,
+      attachToEmail: args.attachToEmail === true || args.asAttachment === true || args.attach === true,
+    },
+  }, context);
+
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'schedule_latest_resource_email_failed',
+    detail: result,
+  };
+}
+
+async function t_list_scheduled_emails(args = {}) {
+  const context = args._context || {};
+  const search = new URLSearchParams();
+  const limit = Number.isFinite(Number(args.limit))
+    ? Math.max(1, Math.min(100, Number(args.limit)))
+    : 20;
+  search.set('limit', String(limit));
+  if (String(args.status || '').trim()) {
+    search.set('status', String(args.status).trim());
+  }
+
+  const result = await fetchInternalJson(`/api/mail/scheduled?${search.toString()}`, {
+    method: 'GET',
+  }, context);
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'list_scheduled_emails_failed',
+    detail: result,
+  };
+}
+
+async function t_cancel_scheduled_email(args = {}) {
+  const context = args._context || {};
+  const jobId = String(args.jobId || args.id || args.scheduledId || '').trim();
+  if (!jobId) {
+    throw new Error('cancel_scheduled_email: missing "jobId"');
+  }
+
+  const result = await fetchInternalJson(`/api/mail/scheduled/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+    body: {},
+  }, context);
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'cancel_scheduled_email_failed',
+    detail: result,
+  };
+}
+
+async function t_send_email(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('send_email: missing "to"');
+  }
+
+  const includeAttachments = args.attachToEmail !== false;
+  const attachmentPaths = includeAttachments ? listAttachmentPaths(args) : [];
+  const attachments = attachmentPaths.map((candidate, index) => {
+    const fullPath = resolveManagedPath(candidate, `send_email.path[${index}]`);
+    return buildAttachmentPayload(fullPath, index, args.filename || '');
+  });
+
+  const payload = {
+    to: recipients,
+    subject: args.subject || args.emailSubject || 'A11',
+    message: args.message || args.emailMessage || args.body || args.text || args.content || '',
+    html: args.html || '',
+    conversationId: args.conversationId || args.convId || args.sessionId || null,
+    attachments,
+  };
+
+  const result = await fetchInternalJson('/api/mail/send', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      to: recipients,
+      subject: payload.subject,
+      attachmentCount: attachments.length,
+      mail: result.mail || null,
+    };
+  }
+
+  return {
+    ok: false,
+    to: recipients,
+    subject: payload.subject,
+    error: result?.error || result?.message || 'send_email_failed',
+    detail: result,
+  };
 }
 
 function isPathInRoots(p) {
@@ -275,27 +1512,81 @@ function ensureToolAvailable(name) {
   return spec;
 }
 
-const SHELL_WHITELIST = [
-  /^git status\b/i,
-  /^git diff\b/i,
-  /^npm test\b/i,
-  /^npm run build\b/i,
-  /^dotnet --info\b/i,
-  /^dotnet build\b/i
-];
-
-function isShellAllowed(cmd) {
-  if (!cmd || typeof cmd !== 'string') return false;
-  return SHELL_WHITELIST.some(re => re.test(cmd.trim()));
-}
-
 // QFLUSH
 async function t_qflush_flow(args = {}) {
   const { flow, payload } = args;
   if (!flow || typeof flow !== 'string') {
     throw new Error('qflush_flow: missing "flow"');
   }
-  return await runQflushFlow(flow, payload || {});
+  return await runQflushFlow(flow, payload || {}, {
+    admin: args.admin === true,
+  });
+}
+
+function resolveQflushMemoryScope(args = {}) {
+  const context = args._context || {};
+  const explicitScope = String(args.scope || '').trim();
+  if (explicitScope) return explicitScope;
+  const conversationId = String(
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    ''
+  ).trim();
+  if (conversationId) return `conversation:${conversationId}`;
+  const userId = String(args.userId || context.userId || '').trim();
+  if (userId) return `user:${userId}`;
+  return 'shared';
+}
+
+function resolveQflushMemoryNamespace(args = {}) {
+  return String(args.namespace || 'a11').trim() || 'a11';
+}
+
+async function runQflushMemoryOperation(op, args = {}) {
+  return await runQflushFlow('a11.memory.ephemeral.v1', {
+    op,
+    key: args.key,
+    value: args.value,
+    ttlSec: args.ttlSec ?? args.ttl ?? args.expiresInSec,
+    scope: resolveQflushMemoryScope(args),
+    namespace: resolveQflushMemoryNamespace(args),
+    prefix: args.prefix,
+    limit: args.limit,
+    metadata: args.metadata,
+  }, {
+    admin: true,
+  });
+}
+
+async function t_qflush_memory_write(args = {}) {
+  if (!String(args.key || '').trim()) {
+    throw new Error('qflush_memory_write: missing "key"');
+  }
+  return await runQflushMemoryOperation('set', args);
+}
+
+async function t_qflush_memory_read(args = {}) {
+  if (!String(args.key || '').trim()) {
+    throw new Error('qflush_memory_read: missing "key"');
+  }
+  return await runQflushMemoryOperation('get', args);
+}
+
+async function t_qflush_memory_list(args = {}) {
+  return await runQflushMemoryOperation('list', args);
+}
+
+async function t_qflush_memory_delete(args = {}) {
+  if (!String(args.key || '').trim()) {
+    throw new Error('qflush_memory_delete: missing "key"');
+  }
+  return await runQflushMemoryOperation('delete', args);
+}
+
+async function t_qflush_memory_clear(args = {}) {
+  return await runQflushMemoryOperation('clear', args);
 }
 
 // FS
@@ -309,23 +1600,41 @@ async function t_fs_read(args = {}) {
 async function t_fs_write(args = {}) {
   const { path: filePath, content, overwrite } = args;
   assertPathAllowed(filePath, 'fs_write.path');
-  if (!overwrite && fsSync.existsSync(filePath)) {
-    throw new Error(`fs_write: file already exists and overwrite=false: ${filePath}`);
+  const writeTarget = await resolveWriteTarget(filePath, {
+    overwrite: overwrite === true,
+    content: String(content || ''),
+  });
+  await fsp.mkdir(path.dirname(writeTarget.path), { recursive: true });
+  if (!writeTarget.reusedExisting) {
+    await fsp.writeFile(writeTarget.path, String(content || ''), 'utf8');
   }
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, String(content || ''), 'utf8');
-  return { ok: true, path: filePath };
+  return {
+    ok: true,
+    path: writeTarget.path,
+    requestedPath: writeTarget.requestedPath,
+    collisionResolved: writeTarget.collisionResolved,
+    reusedExisting: writeTarget.reusedExisting,
+  };
 }
 
 async function t_write_file(args = {}) {
   const rawPath = args.path;
   const filePath = resolveSafePath(rawPath, "write_file.path");
-  if (!args.overwrite && fsSync.existsSync(filePath)) {
-    throw new Error(`write_file: file already exists and overwrite=false: ${filePath}`);
+  const writeTarget = await resolveWriteTarget(filePath, {
+    overwrite: args.overwrite === true,
+    content: String(args.content || ''),
+  });
+  await fsp.mkdir(path.dirname(writeTarget.path), { recursive: true });
+  if (!writeTarget.reusedExisting) {
+    await fsp.writeFile(writeTarget.path, String(args.content || ''), 'utf8');
   }
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, String(args.content || ''), 'utf8');
-  return { ok: true, path: filePath };
+  return {
+    ok: true,
+    path: writeTarget.path,
+    requestedPath: writeTarget.requestedPath,
+    collisionResolved: writeTarget.collisionResolved,
+    reusedExisting: writeTarget.reusedExisting,
+  };
 }
 
 async function t_fs_list(args = {}) {
@@ -376,22 +1685,95 @@ async function t_fs_move(args = {}) {
   return { ok: true, from, to };
 }
 
-// ZIP (stub)
-async function t_zip_create(args = {}) {
-  const { inputPaths, outputPath } = args;
-  assertPathAllowed(outputPath, 'zip_create.outputPath');
-  if (!Array.isArray(inputPaths) || inputPaths.length === 0) {
+function buildZipEntryName(candidatePath, usedEntries) {
+  const rawBase = path.basename(candidatePath) || `entry-${usedEntries.size + 1}`;
+  const ext = path.extname(rawBase);
+  const name = path.basename(rawBase, ext);
+  let entryName = rawBase;
+  let suffix = 2;
+  while (usedEntries.has(entryName.toLowerCase())) {
+    entryName = `${name}-${suffix}${ext}`;
+    suffix += 1;
+  }
+  usedEntries.add(entryName.toLowerCase());
+  return entryName;
+}
+
+async function createZipBundle(args = {}) {
+  const rawInputPaths = Array.isArray(args.inputPaths)
+    ? args.inputPaths
+    : Array.isArray(args.paths)
+      ? args.paths
+      : [];
+  if (!rawInputPaths.length) {
     throw new Error('zip_create: inputPaths must be a non-empty array');
   }
-  inputPaths.forEach(p => assertPathAllowed(p, 'zip_create.inputPaths'));
-  return { ok: true, outputPath, stub: true };
+
+  const outputPath = args.outputPath
+    ? resolveManagedPath(args.outputPath, 'zip_create.outputPath')
+    : buildGeneratedAssetPath(`bundle-${Date.now()}.zip`, 'zip_create.outputPath');
+  const inputPaths = rawInputPaths.map((candidate, index) => resolveManagedPath(candidate, `zip_create.inputPaths[${index}]`));
+  const zip = new AdmZip();
+  const usedEntries = new Set();
+
+  for (const inputPath of inputPaths) {
+    const stats = fsSync.statSync(inputPath);
+    if (stats.isDirectory()) {
+      zip.addLocalFolder(inputPath, buildZipEntryName(inputPath, usedEntries));
+    } else {
+      zip.addLocalFile(inputPath, '', buildZipEntryName(inputPath, usedEntries));
+    }
+  }
+
+  await fsp.mkdir(path.dirname(outputPath), { recursive: true });
+  zip.writeZip(outputPath);
+  const written = fsSync.statSync(outputPath);
+
+  return {
+    ok: true,
+    outputPath,
+    inputPaths,
+    inputCount: inputPaths.length,
+    sizeBytes: written.size,
+  };
+}
+
+async function t_zip_create(args = {}) {
+  return createZipBundle(args);
 }
 
 async function t_unzip_extract(args = {}) {
-  const { zipPath, outputDir } = args;
-  assertPathAllowed(zipPath, 'unzip_extract.zipPath');
-  assertPathAllowed(outputDir, 'unzip_extract.outputDir');
-  return { ok: true, zipPath, outputDir, stub: true };
+  const zipPath = resolveManagedPath(args.zipPath, 'unzip_extract.zipPath');
+  const outputDir = args.outputDir
+    ? resolveManagedPath(args.outputDir, 'unzip_extract.outputDir')
+    : buildGeneratedAssetPath(`unzip-${Date.now()}`, 'unzip_extract.outputDir');
+  const zip = new AdmZip(zipPath);
+  await fsp.mkdir(outputDir, { recursive: true });
+  zip.extractAllTo(outputDir, true);
+  return { ok: true, zipPath, outputDir };
+}
+
+async function t_zip_and_email(args = {}) {
+  const zipResult = await createZipBundle({
+    inputPaths: Array.isArray(args.inputPaths) ? args.inputPaths : args.paths,
+    outputPath: args.outputPath || args.zipPath || args.path || null,
+  });
+
+  const emailResult = await t_send_email({
+    ...args,
+    path: zipResult.outputPath,
+    paths: null,
+    attachments: null,
+    filename: args.filename || path.basename(zipResult.outputPath),
+    subject: args.subject || args.emailSubject || 'A11 — archive ZIP',
+    message: args.message || args.emailMessage || args.body || 'Archive ZIP prête.',
+  });
+
+  return {
+    ok: emailResult?.ok === true,
+    zip: zipResult,
+    mail: emailResult,
+  };
 }
 
 // SHELL
@@ -429,7 +1811,42 @@ async function t_web_fetch(args = {}) {
   if (!url || typeof url !== 'string') {
     throw new Error('web_fetch: missing "url"');
   }
-  return await runQflushFlow('web_fetch', { url });
+  try {
+    return await runQflushFlow('web_fetch', { url });
+  } catch (error_) {
+    const response = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    });
+
+    const html = String(response.data || '');
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/gi, "'")
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return {
+      ok: true,
+      url,
+      status: Number(response.status || 0) || 200,
+      title: titleMatch?.[1]?.replace(/\s+/g, ' ').trim() || undefined,
+      content: text.slice(0, 8000),
+      fetchedVia: 'http-fallback',
+      warning: `web_fetch fallback utilise (QFLUSH indisponible: ${error_?.message || error_})`,
+    };
+  }
 }
 
 // WEB SEARCH (DuckDuckGo minimal)
@@ -443,16 +1860,23 @@ async function t_web_search(args = {}) {
   }
 
   const url = "https://duckduckgo.com/html/?q=" + encodeURIComponent(q);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  let html = "";
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
+      signal: controller.signal,
+    });
+    html = await resp.text();
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
-  const resp = await axios.get(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-  });
-
-  const html = resp.data || "";
   const results = [];
   // Extraction des liens classiques
   const regex = /<a[^>]+class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*?)<\/a>[\s\S]*?<a[^>]+class=\"result__snippet\"[^>]*>(.*?)<\/a>/gi;
@@ -462,13 +1886,14 @@ async function t_web_search(args = {}) {
     const href = match[1];
     const rawTitle = match[2] || "";
     const rawSnippet = match[3] || "";
+    const decodedHref = decodeDuckDuckGoResultUrl(href);
 
     const title = rawTitle.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
     const snippet = rawSnippet.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
 
     results.push({
       title,
-      url: href,
+      url: decodedHref,
       snippet,
       isImage: false
     });
@@ -499,6 +1924,20 @@ async function t_web_search(args = {}) {
   };
 }
 
+function decodeDuckDuckGoResultUrl(rawUrl) {
+  const candidate = String(rawUrl || '').trim();
+  if (!candidate) return '';
+
+  const normalized = candidate.startsWith('//') ? `https:${candidate}` : candidate;
+  try {
+    const url = new URL(normalized);
+    const uddg = url.searchParams.get('uddg');
+    return uddg ? decodeURIComponent(uddg) : normalized;
+  } catch {
+    return normalized;
+  }
+}
+
 // FS SEARCH (via QFlush)
 async function t_fs_search(args = {}) {
   // Appelle QFlush pour effectuer la recherche de fichiers
@@ -518,9 +1957,15 @@ async function t_llm_analyze_text(args = {}) {
   };
 }
 
-// Helper pour charger une image (URL ou path)
-async function loadImageBuffer(ref) {
-  if (!ref || typeof ref !== 'string') return null;
+// Helper pour charger une image (URL, path, ou ressource de conversation)
+async function loadImageBuffer(ref, options = {}) {
+  if (!ref || typeof ref !== 'string') {
+    return {
+      ok: false,
+      ref: String(ref || '').trim(),
+      error: 'image_ref_missing',
+    };
+  }
 
   // URL HTTP/HTTPS
   if (/^https?:\/\//i.test(ref)) {
@@ -528,38 +1973,134 @@ async function loadImageBuffer(ref) {
       const r = await fetch(ref);
       if (!r.ok) {
         console.warn('[generate_pdf] image URL failed:', ref, r.status);
-        return null;
+        return {
+          ok: false,
+          ref,
+          error: 'image_url_unavailable',
+          status: Number(r.status || 0) || null,
+        };
       }
       const ab = await r.arrayBuffer();
-      return Buffer.from(ab);
+      return {
+        ok: true,
+        ref,
+        source: 'url',
+        buffer: Buffer.from(ab),
+      };
     } catch (e) {
       console.warn('[generate_pdf] image URL error:', ref, e && e.message);
-      return null;
+      return {
+        ok: false,
+        ref,
+        error: 'image_url_fetch_failed',
+        detail: e && e.message ? String(e.message) : String(e || ''),
+      };
     }
   }
 
+  if (/^\/api\//i.test(ref)) {
+    const downloaded = await fetchInternalBuffer(ref, { method: 'GET' }, options.context || {});
+    if (downloaded?.ok && downloaded.buffer) {
+      return {
+        ok: true,
+        ref,
+        source: 'api',
+        buffer: downloaded.buffer,
+      };
+    }
+    return {
+      ok: false,
+      ref,
+      error: 'image_api_unavailable',
+      detail: String(downloaded?.error || downloaded?.status || 'unknown'),
+    };
+  }
+
   // Chemin local
-  let filePath = ref;
+  let filePath = String(ref).trim();
   if (!path.isAbsolute(filePath)) {
-    // tu peux adapter la racine, j’ai mis D:/A12 par défaut
-    filePath = path.resolve('D:/A12', filePath);
+    filePath = resolveSafePath(filePath, 'generate_pdf.image');
   }
 
   try {
-    return await fsp.readFile(filePath);
+    return {
+      ok: true,
+      ref,
+      source: 'path',
+      resolvedPath: filePath,
+      buffer: await fsp.readFile(filePath),
+    };
   } catch (e) {
+    const matchedResource = await resolveStoredConversationResource(ref, options).catch(() => null);
+    if (matchedResource?.id) {
+      const downloaded = await fetchInternalBuffer(`/api/resources/${matchedResource.id}/download`, {
+        method: 'GET',
+      }, options.context || {});
+      if (downloaded?.ok && downloaded.buffer) {
+        return {
+          ok: true,
+          ref,
+          source: 'conversation_resource',
+          resourceId: matchedResource.id,
+          resolvedPath: `/api/resources/${matchedResource.id}/download`,
+          buffer: downloaded.buffer,
+        };
+      }
+      console.warn('[generate_pdf] stored image download failed:', matchedResource.id, downloaded?.error || downloaded?.status || 'unknown');
+    }
+    const matchedFile = await resolveStoredUserFile(ref, options).catch(() => null);
+    if (matchedFile?.url) {
+      try {
+        const remote = await fetch(String(matchedFile.url));
+        if (remote.ok) {
+          const arrayBuffer = await remote.arrayBuffer();
+          return {
+            ok: true,
+            ref,
+            source: 'stored_file_url',
+            resolvedPath: String(matchedFile.url),
+            buffer: Buffer.from(arrayBuffer),
+          };
+        }
+        console.warn('[generate_pdf] stored file image URL failed:', matchedFile.url, remote.status);
+      } catch (remoteError) {
+        console.warn('[generate_pdf] stored file image URL error:', matchedFile.url, remoteError?.message || remoteError);
+      }
+    }
     console.warn('[generate_pdf] image file not found:', filePath);
-    return null;
+    return {
+      ok: false,
+      ref,
+      error: 'image_not_found',
+      resolvedPath: filePath,
+      detail: e && e.message ? String(e.message) : '',
+    };
   }
 }
 
 // PDF (generate)
 async function t_generate_pdf(args = {}) {
   let { outputPath, title, content, sections, author, date } = args;
+  const context = args._context || {};
+  const conversationId = String(
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    context.convId ||
+    context.sessionId ||
+    ''
+  ).trim();
+  const resourceCache = {
+    resolvedByRef: new Map(),
+    resolvedStoredFilesByRef: new Map(),
+    resourcesPromise: null,
+    storedFilesPromise: null,
+  };
 
-  if (!outputPath) {
-    outputPath = path.resolve("D:/A12", "expose_lyceen.pdf");
-  }
+  outputPath = outputPath
+    ? resolveSafePath(outputPath, 'generate_pdf.outputPath')
+    : buildGeneratedAssetPath(`expose_${Date.now()}.pdf`, 'generate_pdf.outputPath');
 
   // Securise la création du dossier avant d'écrire le PDF
   await fsp.mkdir(path.dirname(outputPath), { recursive: true });
@@ -568,6 +2109,55 @@ async function t_generate_pdf(args = {}) {
   author = author || "Auteur: Anonyme";
   date = date || new Date().toLocaleDateString();
   sections = Array.isArray(sections) ? sections : [];
+  const failOnMissingImages = (
+    args.allowMissingImages !== true
+    && args.skipMissingImages !== true
+    && args.strictImages !== false
+    && args.strictAssets !== false
+  );
+  const missingAssets = [];
+  const preparedSections = [];
+
+  for (let idx = 0; idx < sections.length; idx++) {
+    const section = sections[idx] || {};
+    const heading = section.heading || section.title || `Section ${idx + 1}`;
+    const text = section.text || section.content || "";
+    const images = Array.isArray(section.images) ? section.images : [];
+    const resolvedImages = [];
+
+    for (const ref of images) {
+      const imageResult = await loadImageBuffer(ref, {
+        context,
+        conversationId,
+        resourceCache,
+      });
+      if (!imageResult?.ok || !Buffer.isBuffer(imageResult.buffer)) {
+        missingAssets.push({
+          sectionIndex: idx,
+          heading,
+          ref: String(ref || '').trim(),
+          error: String(imageResult?.error || 'image_not_found'),
+          resolvedPath: String(imageResult?.resolvedPath || '').trim() || null,
+          detail: String(imageResult?.detail || '').trim() || null,
+        });
+        continue;
+      }
+      resolvedImages.push(imageResult);
+    }
+
+    preparedSections.push({
+      heading,
+      text,
+      images: resolvedImages,
+    });
+  }
+
+  if (missingAssets.length && failOnMissingImages) {
+    const error = new Error(`generate_pdf_missing_assets: ${missingAssets.map((entry) => entry.ref).join(', ')}`);
+    error.code = 'generate_pdf_missing_assets';
+    error.missingAssets = missingAssets;
+    throw error;
+  }
 
   const doc = new PDFDocument({ margin: 50 });
   const stream = fs.createWriteStream(outputPath);
@@ -600,10 +2190,10 @@ async function t_generate_pdf(args = {}) {
   doc.addPage();
 
   // ----------- Sections -----------
-  for (let idx = 0; idx < sections.length; idx++) {
-    const section = sections[idx];
-    const heading = section.heading || section.title || `Section ${idx + 1}`;
-    const text = section.text || section.content || "";
+  for (let idx = 0; idx < preparedSections.length; idx++) {
+    const section = preparedSections[idx];
+    const heading = section.heading;
+    const text = section.text;
     const images = Array.isArray(section.images) ? section.images : [];
 
     doc.fontSize(18).fillColor('#2563eb').font("Helvetica-Bold").text(heading, { align: "left" }).moveDown(1);
@@ -611,9 +2201,8 @@ async function t_generate_pdf(args = {}) {
       doc.fontSize(12).fillColor('#111827').font("Helvetica").text(text, { align: "left" }).moveDown(1);
     }
     // Images centrées
-    for (const ref of images) {
-      const buf = await loadImageBuffer(ref);
-      if (!buf) continue;
+    for (const image of images) {
+      const buf = image.buffer;
       const maxWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
       doc.moveDown(0.5).image(buf, {
         fit: [maxWidth * 0.8, 250],
@@ -637,24 +2226,482 @@ async function t_generate_pdf(args = {}) {
 
   return {
     ok: true,
-    outputPath
+    outputPath,
+    imageCount: preparedSections.reduce((total, section) => total + (Array.isArray(section.images) ? section.images.length : 0), 0),
+    missingAssets,
   };
 }
 
-// PNG (stub)
+// PNG placeholder generator (safe fallback for dev actions)
 async function t_generate_png(args = {}) {
-  return { ok: true, stub: true, args };
+  const size = parseImageSize(args.imageSize, Number(args.width || 1024), Number(args.height || 1024));
+  const width = Math.max(64, Math.min(2048, Number(args.width || size.width || 1024)));
+  const height = Math.max(64, Math.min(2048, Number(args.height || size.height || 1024)));
+  const title = String(
+    args.text ||
+    args.prompt ||
+    args.imageDescription ||
+    args.imageType ||
+    'Illustration A11'
+  ).trim() || 'Illustration A11';
+  const subtitle = String(args.subtitle || 'Image de secours generee par A11').trim();
+  const baseName = `${slugifyAssetSegment(title, 'image')}-${Date.now()}.png`;
+  const outputPath = args.outputPath || args.path || args.imagePath
+    ? resolveSafePath(args.outputPath || args.path || args.imagePath, 'generate_png.outputPath')
+    : buildGeneratedAssetPath(baseName, 'generate_png.outputPath');
+
+  await fsp.mkdir(path.dirname(outputPath), { recursive: true });
+
+  const proxyUrl = resolveSdProxyUrl();
+  if (proxyUrl) {
+    const proxyPayload = {
+      prompt: title,
+      negative_prompt: String(
+        args.negativePrompt ||
+        args.negative_prompt ||
+        'blurry, abstract, deformed, extra limbs, bad anatomy, low quality, text, watermark'
+      ).trim(),
+      num_inference_steps: Math.max(1, Number(args.numInferenceSteps || args.num_inference_steps || 35) || 35),
+      guidance_scale: Number(args.guidanceScale || args.guidance_scale || 8.0) || 8.0,
+      width,
+      height,
+      ...(args.seed !== undefined && args.seed !== null && String(args.seed).trim() !== ''
+        ? { seed: String(args.seed).trim() }
+        : {}),
+    };
+
+    const proxyResult = await fetch(proxyUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(proxyPayload),
+    })
+      .then(async (response) => {
+        const text = await response.text();
+        let body = null;
+        try {
+          body = text ? JSON.parse(text) : null;
+        } catch {
+          body = null;
+        }
+        return { ok: response.ok, status: response.status, body, text };
+      })
+      .catch((error_) => ({ ok: false, error: String(error_?.message || error_) }));
+
+    const remoteImageUrl = String(
+      proxyResult?.body?.image_url ||
+      proxyResult?.body?.url ||
+      ''
+    ).trim();
+
+    if (proxyResult?.ok && remoteImageUrl) {
+      try {
+        const remoteImage = await axios.get(remoteImageUrl, {
+          responseType: 'arraybuffer',
+          timeout: 60000,
+        });
+        await fsp.writeFile(outputPath, Buffer.from(remoteImage.data));
+        return {
+          ok: true,
+          outputPath,
+          width,
+          height,
+          mode: 'stable-diffusion-proxy',
+          prompt: title,
+          sourceUrl: remoteImageUrl,
+        };
+      } catch (error_) {
+        console.warn('[A11][generate_png] proxy image download failed:', error_?.message);
+      }
+    } else if (proxyResult?.status) {
+      console.warn('[A11][generate_png] proxy failed:', proxyResult.status, proxyResult.text || proxyResult.error || '');
+    }
+  }
+
+  const enableSd = String(process.env.ENABLE_SD || '').trim().toLowerCase() === 'true';
+  const scriptPath = resolveSdScriptPath();
+  if (enableSd && scriptPath && fsSync.existsSync(scriptPath)) {
+    const negativePrompt = String(
+      args.negativePrompt ||
+      args.negative_prompt ||
+      'blurry, abstract, deformed, extra limbs, bad anatomy, low quality, text, watermark'
+    ).trim();
+    const numInferenceSteps = Math.max(1, Number(args.numInferenceSteps || args.num_inference_steps || 35) || 35);
+    const guidanceScale = Number(args.guidanceScale || args.guidance_scale || 8.0) || 8.0;
+    const seed = args.seed !== undefined && args.seed !== null && String(args.seed).trim() !== ''
+      ? String(args.seed).trim()
+      : '';
+    const sdResult = await runSdScript({
+      prompt: title,
+      negative_prompt: negativePrompt,
+      num_inference_steps: numInferenceSteps,
+      guidance_scale: guidanceScale,
+      width,
+      height,
+      ...(seed ? { seed } : {}),
+      output: outputPath,
+    }, { scriptPath });
+
+    if (sdResult && sdResult.ok && sdResult.output_path && fsSync.existsSync(sdResult.output_path)) {
+      return {
+        ok: true,
+        outputPath: sdResult.output_path,
+        width,
+        height,
+        mode: 'stable-diffusion',
+        prompt: title,
+        negativePrompt,
+        numInferenceSteps,
+        guidanceScale,
+        seed: seed ? Number(seed) : undefined,
+      };
+    }
+  }
+
+  const sharp = require('sharp');
+
+  const safeTitle = title
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+  const safeSubtitle = subtitle
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+
+  const svg = `
+    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#0f172a"/>
+          <stop offset="100%" stop-color="#1d4ed8"/>
+        </linearGradient>
+      </defs>
+      <rect width="100%" height="100%" rx="28" fill="url(#bg)"/>
+      <circle cx="${Math.round(width * 0.78)}" cy="${Math.round(height * 0.22)}" r="${Math.round(Math.min(width, height) * 0.09)}" fill="#38bdf8" fill-opacity="0.22"/>
+      <circle cx="${Math.round(width * 0.18)}" cy="${Math.round(height * 0.76)}" r="${Math.round(Math.min(width, height) * 0.11)}" fill="#f59e0b" fill-opacity="0.18"/>
+      <text x="50%" y="42%" text-anchor="middle" font-family="Arial, sans-serif" font-size="${Math.max(28, Math.round(Math.min(width, height) * 0.08))}" font-weight="700" fill="#f8fafc">${safeTitle}</text>
+      <text x="50%" y="58%" text-anchor="middle" font-family="Arial, sans-serif" font-size="${Math.max(16, Math.round(Math.min(width, height) * 0.035))}" fill="#cbd5e1">${safeSubtitle}</text>
+      <text x="50%" y="84%" text-anchor="middle" font-family="Arial, sans-serif" font-size="${Math.max(12, Math.round(Math.min(width, height) * 0.024))}" fill="#93c5fd">A11 placeholder PNG</text>
+    </svg>
+  `;
+
+  await sharp(Buffer.from(svg)).png().toFile(outputPath);
+
+  return {
+    ok: true,
+    outputPath,
+    width,
+    height,
+    mode: 'placeholder',
+    prompt: title,
+  };
 }
 
-// VS / A11Host (stubs)
+async function t_vision_analyze(args = {}) {
+  const context = args._context || {};
+  const conversationId = String(
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    context.convId ||
+    context.sessionId ||
+    ''
+  ).trim();
+  const resourceCache = {
+    resolvedByRef: new Map(),
+    resolvedStoredFilesByRef: new Map(),
+    resourcesPromise: null,
+    storedFilesPromise: null,
+  };
+
+  const source = await resolveVisionImageSource(args, {
+    context,
+    conversationId,
+    resourceCache,
+  });
+  const analysis = await analyzeUploadedResource({
+    filename: source.filename,
+    contentType: source.contentType,
+    buffer: source.buffer,
+  });
+
+  let remoteDescription = '';
+  try {
+    remoteDescription = String(await describeImageWithRemoteVision(source, args) || '').trim();
+  } catch (error_) {
+    remoteDescription = '';
+  }
+
+  return {
+    ok: true,
+    task: String(args.task || 'describe').trim() || 'describe',
+    summary: buildVisionSummary(source, analysis, remoteDescription, args.task),
+    description: remoteDescription || null,
+    analysis,
+    source: {
+      kind: source.source,
+      filename: source.filename,
+      contentType: source.contentType,
+      path: source.path || null,
+      url: source.url || source.resource?.url || source.file?.url || null,
+      resourceId: source.resourceId || source.resource?.id || null,
+    },
+  };
+}
+
+// VS / A11Host
 async function t_vs_status() {
-  return { ok: true, available: false, methods: [] };
+  return await getA11HostStatus();
 }
+
+async function requireA11HostCapability(capabilityKey, unavailableError) {
+  const status = await getA11HostStatus();
+  if (!status.capabilities?.[capabilityKey]) {
+    return {
+      ok: false,
+      error: unavailableError,
+      mode: status.mode,
+      bridgeAvailable: status.bridgeAvailable,
+      capabilities: status.capabilities
+    };
+  }
+  return status;
+}
+
+function parseA11HostPayload(payload, fallbackKey) {
+  if (typeof payload !== 'string') {
+    return fallbackKey ? { [fallbackKey]: payload } : payload;
+  }
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return fallbackKey ? { [fallbackKey]: payload } : payload;
+  }
+}
+
+async function t_vs_workspace_root() {
+  const status = await requireA11HostCapability('workspaceRoot', 'vs_workspace_root unavailable');
+  if (!status.ok) return status;
+
+  const root = await callA11Host('GetWorkspaceRoot');
+  return {
+    ok: true,
+    root,
+    mode: status.mode
+  };
+}
+
+async function t_vs_compilation_errors() {
+  const status = await requireA11HostCapability('compilationErrors', 'vs_compilation_errors unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetCompilationErrors');
+  const parsed = parseA11HostPayload(payload, 'errors');
+  const errors = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.errors) ? parsed.errors : []);
+  return {
+    ok: true,
+    errors,
+    raw: parsed,
+    mode: status.mode
+  };
+}
+
+async function t_vs_project_structure() {
+  const status = await requireA11HostCapability('projectStructure', 'vs_project_structure unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetProjectStructure');
+  const parsed = parseA11HostPayload(payload, 'projectStructure');
+  return {
+    ok: true,
+    projectStructure: parsed,
+    mode: status.mode
+  };
+}
+
+async function t_vs_solution_info() {
+  const status = await requireA11HostCapability('solutionInfo', 'vs_solution_info unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetSolutionInfo');
+  const parsed = parseA11HostPayload(payload, 'solutionInfo');
+  return {
+    ok: true,
+    solutionInfo: parsed,
+    mode: status.mode
+  };
+}
+
+async function t_vs_active_document() {
+  const status = await requireA11HostCapability('activeDocument', 'vs_active_document unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetActiveDocument');
+  const parsed = parseA11HostPayload(payload, 'document');
+  return {
+    ok: true,
+    document: parsed,
+    mode: status.mode
+  };
+}
+
+async function t_vs_current_selection() {
+  const status = await requireA11HostCapability('currentSelection', 'vs_current_selection unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetCurrentSelection');
+  const parsed = parseA11HostPayload(payload, 'text');
+  const text = typeof parsed === 'string'
+    ? parsed
+    : (typeof parsed?.text === 'string' ? parsed.text : String(parsed?.text || ''));
+  return {
+    ok: true,
+    text,
+    raw: parsed,
+    mode: status.mode
+  };
+}
+
 async function t_vs_open_file(args = {}) {
-  return { ok: false, error: 'vs_open_file not wired yet' };
+  const filePath = String(args.path || '').trim();
+  if (!filePath) {
+    throw new Error('vs_open_file: missing "path"');
+  }
+
+  const status = await requireA11HostCapability('openFile', 'vs_open_file unavailable');
+  if (!status.ok) return status;
+
+  const success = await callA11Host('OpenFile', filePath);
+  return {
+    ok: true,
+    success,
+    path: filePath,
+    mode: status.mode
+  };
 }
+
+async function t_vs_goto_line(args = {}) {
+  const filePath = String(args.path || '').trim();
+  const line = Number(args.line);
+  if (!filePath) {
+    throw new Error('vs_goto_line: missing "path"');
+  }
+  if (!Number.isInteger(line) || line < 1) {
+    throw new Error('vs_goto_line: invalid "line"');
+  }
+
+  const status = await requireA11HostCapability('gotoLine', 'vs_goto_line unavailable');
+  if (!status.ok) return status;
+
+  const success = await callA11Host('GotoLine', filePath, line);
+  return {
+    ok: true,
+    success,
+    path: filePath,
+    line,
+    mode: status.mode
+  };
+}
+
+async function t_vs_open_documents() {
+  const status = await requireA11HostCapability('openDocuments', 'vs_open_documents unavailable');
+  if (!status.ok) return status;
+
+  const docs = await callA11Host('GetOpenDocuments');
+  let documents = docs;
+  if (typeof docs === 'string') {
+    try {
+      documents = JSON.parse(docs);
+    } catch {
+      documents = [docs];
+    }
+  }
+
+  return {
+    ok: true,
+    documents,
+    mode: status.mode
+  };
+}
+
+async function t_vs_execute_shell(args = {}) {
+  const command = String(args.command || '').trim();
+  if (!command) {
+    throw new Error('vs_execute_shell: missing "command"');
+  }
+  if (!isShellAllowed(command)) {
+    return {
+      ok: false,
+      error: `vs_execute_shell: command not allowed by whitelist: "${command}"`,
+      command
+    };
+  }
+
+  const status = await requireA11HostCapability('executeShell', 'vs_execute_shell unavailable');
+  if (!status.ok) return status;
+
+  try {
+    const rawResult = await callA11Host('ExecuteShell', command);
+    const normalized =
+      rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+        ? rawResult
+        : {
+            ok: true,
+            command,
+            exitCode: 0,
+            stdout: String(rawResult || ''),
+            stderr: '',
+            output: String(rawResult || ''),
+            unavailable: false,
+            message: null,
+          };
+    const output = String(
+      normalized.output ||
+      [normalized.stdout, normalized.stderr].filter(Boolean).join('\n')
+    ).trim();
+    const unavailable =
+      normalized.unavailable === true ||
+      Number(normalized.exitCode) === 127 ||
+      /not found|is not recognized|command not found|enoent/i.test(String(normalized.stderr || normalized.message || ''));
+    const message = String(
+      normalized.message ||
+      (unavailable
+        ? `La commande "${getShellToolName(command) || command.split(/\s+/)[0]}" n'est pas disponible sur ce runtime A11.`
+        : normalized.stderr || '')
+    ).trim();
+    return {
+      ok: normalized.ok !== false && Number(normalized.exitCode || 0) === 0,
+      command,
+      output,
+      stdout: String(normalized.stdout || ''),
+      stderr: String(normalized.stderr || ''),
+      exitCode: Number.isFinite(normalized.exitCode) ? Number(normalized.exitCode) : 0,
+      unavailable,
+      message: message || null,
+      mode: status.mode
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      command,
+      mode: status.mode,
+      error: err?.message || String(err)
+    };
+  }
+}
+
 async function t_vs_build_solution() {
-  return { ok: false, error: 'vs_build_solution not wired yet' };
+  const status = await requireA11HostCapability('buildSolution', 'vs_build_solution unavailable');
+  if (!status.ok) return status;
+
+  const success = await callA11Host('BuildSolution');
+  return {
+    ok: true,
+    success,
+    mode: status.mode
+  };
 }
 
 async function t_a11_env_snapshot(_args = {}) {
@@ -916,9 +2963,260 @@ async function t_tts_advanced(args = {}) {
   };
 }
 
+function normalizeDispatchActionName(name) {
+  const normalized = String(name || '').trim();
+  const lowered = normalized.toLowerCase();
+  if (!lowered) return normalized;
+
+  if (lowered === 'generate_image') return 'generate_png';
+  if (lowered === 'vision' || lowered === 'image_analyze' || lowered === 'analyze_image' || lowered === 'analyse_image') {
+    return 'vision_analyze';
+  }
+  if (lowered === 'zip') return 'zip_create';
+  if (lowered === 'unzip') return 'unzip_extract';
+  if (lowered === 'ocr' || lowered === 'ocr-file') return 'ocr_file';
+  if (lowered === 'websearch') return 'web_search';
+  if (lowered === 'share-file' || lowered === 'sharefile' || lowered === 'upload_file' || lowered === 'publish_file') {
+    return 'share_file';
+  }
+  if (lowered === 'list-stored-files' || lowered === 'list_files' || lowered === 'stored_files' || lowered === 'listfiles') {
+    return 'list_stored_files';
+  }
+  if (lowered === 'list_resources' || lowered === 'list-resource' || lowered === 'list_resource' || lowered === 'list_conversation_resources') {
+    return 'list_resources';
+  }
+  if (lowered === 'get_latest_resource' || lowered === 'latest_resource' || lowered === 'get-latest-resource') {
+    return 'get_latest_resource';
+  }
+  if (lowered === 'send-email' || lowered === 'send_mail' || lowered === 'mail_user' || lowered === 'email_user') {
+    return 'send_email';
+  }
+  if (lowered === 'email_latest_resource' || lowered === 'send_latest_resource_email' || lowered === 'latest_resource_email') {
+    return 'email_latest_resource';
+  }
+  if (lowered === 'email-resource' || lowered === 'emailresource' || lowered === 'send_resource_email' || lowered === 'resource_email') {
+    return 'email_resource';
+  }
+  if (lowered === 'schedule-email' || lowered === 'schedule_mail' || lowered === 'mail_later' || lowered === 'delayed_email') {
+    return 'schedule_email';
+  }
+  if (lowered === 'schedule_resource_email' || lowered === 'schedule-resource-email' || lowered === 'resource_email_later') {
+    return 'schedule_resource_email';
+  }
+  if (lowered === 'schedule_latest_resource_email' || lowered === 'latest_resource_email_later') {
+    return 'schedule_latest_resource_email';
+  }
+  if (lowered === 'list_scheduled_emails' || lowered === 'scheduled_emails' || lowered === 'list-mail-jobs') {
+    return 'list_scheduled_emails';
+  }
+  if (lowered === 'cancel_scheduled_email' || lowered === 'cancel-mail-job' || lowered === 'cancel_scheduled_mail') {
+    return 'cancel_scheduled_email';
+  }
+  if (lowered === 'zip_and_email' || lowered === 'zip-email' || lowered === 'bundle_and_email') {
+    return 'zip_and_email';
+  }
+  if (lowered === 'email_file' || lowered === 'mail_file' || lowered === 'share_and_email_file') {
+    return 'share_file';
+  }
+  if (lowered === 'qflush_memory_write' || lowered === 'qflush_memory_set' || lowered === 'memory_ephemeral_write') {
+    return 'qflush_memory_write';
+  }
+  if (lowered === 'qflush_memory_read' || lowered === 'qflush_memory_get' || lowered === 'memory_ephemeral_read') {
+    return 'qflush_memory_read';
+  }
+  if (lowered === 'qflush_memory_list' || lowered === 'memory_ephemeral_list') {
+    return 'qflush_memory_list';
+  }
+  if (lowered === 'qflush_memory_delete' || lowered === 'memory_ephemeral_delete') {
+    return 'qflush_memory_delete';
+  }
+  if (lowered === 'qflush_memory_clear' || lowered === 'memory_ephemeral_clear') {
+    return 'qflush_memory_clear';
+  }
+
+  return normalized;
+}
+
+function normalizeDispatchActionArgs(actionName, rawArgs = {}) {
+  const args = rawArgs && typeof rawArgs === 'object' ? { ...rawArgs } : {};
+
+  if (actionName === 'share_file') {
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || args?._context?.conversationId || null;
+    }
+    if (!args.emailTo) {
+      args.emailTo = args.to || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.emailSubject) {
+      args.emailSubject = args.subject || '';
+    }
+    if (!args.emailMessage) {
+      args.emailMessage = args.message || args.body || args.text || '';
+    }
+    if (args.attachToEmail == null && args.asAttachment != null) {
+      args.attachToEmail = args.asAttachment;
+    }
+  }
+
+  if (actionName === 'send_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+    if (!Array.isArray(args.paths) && Array.isArray(args.attachments)) {
+      const attachmentPaths = args.attachments
+        .map((item) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item === 'object') return item.path || '';
+          return '';
+        })
+        .filter(Boolean);
+      if (attachmentPaths.length) {
+        args.paths = attachmentPaths;
+      }
+    }
+  }
+
+  if (actionName === 'email_resource') {
+    if (!args.resourceId) {
+      args.resourceId = args.resource_id || args.id || args.conversationResourceId || null;
+    }
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (args.attachToEmail == null && args.asAttachment != null) {
+      args.attachToEmail = args.asAttachment;
+    }
+  }
+
+  if (actionName === 'email_latest_resource') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+  }
+
+  if (actionName === 'list_resources') {
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+  }
+
+  if (actionName === 'get_latest_resource') {
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+  }
+
+  if (actionName === 'schedule_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+  }
+
+  if (actionName === 'schedule_resource_email') {
+    if (!args.resourceId) {
+      args.resourceId = args.resource_id || args.id || args.conversationResourceId || null;
+    }
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+  }
+
+  if (actionName === 'schedule_latest_resource_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+  }
+
+  if (actionName === 'cancel_scheduled_email' && !args.jobId) {
+    args.jobId = args.id || args.scheduledId || args.job || null;
+  }
+
+  if (actionName === 'zip_and_email' && !args.inputPaths) {
+    args.inputPaths = Array.isArray(args.paths) ? args.paths : [];
+  }
+
+  if (actionName === 'list_stored_files' && !args.limit) {
+    args.limit = args.max || args.count || args.top || args.n || undefined;
+  }
+
+  if ((actionName === 'vision_analyze' || actionName === 'ocr_file') && !args.task) {
+    args.task = actionName === 'ocr_file' ? 'ocr' : (args.mode || 'describe');
+  }
+
+  return args;
+}
+
 const TOOL_IMPL = {
   // QFlush
   qflush_flow: t_qflush_flow,
+  qflush_memory_write: t_qflush_memory_write,
+  qflush_memory_read: t_qflush_memory_read,
+  qflush_memory_list: t_qflush_memory_list,
+  qflush_memory_delete: t_qflush_memory_delete,
+  qflush_memory_clear: t_qflush_memory_clear,
 
   // FS
   fs_read: t_fs_read,
@@ -931,7 +3229,9 @@ const TOOL_IMPL = {
 
   // ZIP (stubs)
   zip_create: t_zip_create,
+  zip: t_zip_create,
   unzip_extract: t_unzip_extract,
+  unzip: t_unzip_extract,
 
   // SHELL
   shell_exec: t_shell_exec,
@@ -946,17 +3246,43 @@ const TOOL_IMPL = {
   // LLM
   llm_analyze_text: t_llm_analyze_text,
 
-  // VS / A11Host (stubs)
+  // VS / A11Host
   vs_status: t_vs_status,
+  vs_workspace_root: t_vs_workspace_root,
+  vs_compilation_errors: t_vs_compilation_errors,
+  vs_project_structure: t_vs_project_structure,
+  vs_solution_info: t_vs_solution_info,
+  vs_active_document: t_vs_active_document,
+  vs_current_selection: t_vs_current_selection,
   vs_open_file: t_vs_open_file,
+  vs_goto_line: t_vs_goto_line,
+  vs_open_documents: t_vs_open_documents,
+  vs_execute_shell: t_vs_execute_shell,
   vs_build_solution: t_vs_build_solution,
 
   // PDF / PNG
   generate_pdf: t_generate_pdf,
   generate_png: t_generate_png,
+  vision_analyze: t_vision_analyze,
+  ocr_file: t_vision_analyze,
 
   // Download direct d’image/fichier
   download_file: t_download_file,
+
+  // Stockage / mail
+  share_file: t_share_file,
+  list_stored_files: t_list_stored_files,
+  list_resources: t_list_resources,
+  get_latest_resource: t_get_latest_resource,
+  email_resource: t_email_resource,
+  email_latest_resource: t_email_latest_resource,
+  send_email: t_send_email,
+  schedule_email: t_schedule_email,
+  schedule_resource_email: t_schedule_resource_email,
+  schedule_latest_resource_email: t_schedule_latest_resource_email,
+  list_scheduled_emails: t_list_scheduled_emails,
+  cancel_scheduled_email: t_cancel_scheduled_email,
+  zip_and_email: t_zip_and_email,
 
   // TTS (stubs pour l’instant)
   tts_basic: t_tts_basic,
@@ -965,7 +3291,15 @@ const TOOL_IMPL = {
   // Mémoire A-11 (KV + historique)
   a11_memory_write: t_a11_memory_write,
   a11_memory_read: t_a11_memory_read,
-  a11_memory_history: t_a11_memory_history
+  a11_memory_history: t_a11_memory_history,
+  a11_env_snapshot: t_a11_env_snapshot,
+  a11_debug_echo: t_a11_debug_echo,
+  agent_log: async (args = {}) => {
+    const level = String(args.level || 'info').trim().toLowerCase() || 'info';
+    const message = String(args.message || '').trim() || '(vide)';
+    console.log(`[A11][agent_log][${level}] ${message}`);
+    return { ok: true, level, message };
+  }
 };
 
 // --- Ajout: Validation stricte des noms d'actions ---
@@ -977,23 +3311,29 @@ function validateActionName(name) {
   return { ok: true };
 }
 
+function getAllowedActionNames() {
+  return Object.keys(TOOL_IMPL).sort();
+}
+
 async function runAction(name, args = {}) {
-  if (!TOOL_IMPL[name]) {
+  const normalizedName = normalizeDispatchActionName(name);
+  const normalizedArgs = normalizeDispatchActionArgs(normalizedName, args);
+  if (!TOOL_IMPL[normalizedName]) {
     return {
       ok: false,
-      error: `Unknown tool: ${name}`,
+      error: `Unknown tool: ${normalizedName}`,
       available: Object.keys(TOOL_IMPL)
     };
   }
-  const spec = ensureToolAvailable(name);
-  const impl = TOOL_IMPL[name];
-  console.log(`[Cerbère][tool] ${name} (danger=${spec.dangerLevel || 'unknown'})`, args);
+  const spec = ensureToolAvailable(normalizedName);
+  const impl = TOOL_IMPL[normalizedName];
+  console.log(`[Cerbère][tool] ${normalizedName} (danger=${spec.dangerLevel || 'unknown'})`, normalizedArgs);
   try {
-    const result = await impl(args);
-    return { tool: name, ok: true, result };
+    const result = await impl(normalizedArgs);
+    return { tool: normalizedName, ok: true, result };
   } catch (err) {
     return {
-      tool: name,
+      tool: normalizedName,
       ok: false,
       error: err?.message || String(err),
       stack: err?.stack || null
@@ -1020,7 +3360,7 @@ function isIgnoredMemoryKey(actionName, args) {
 }
 
 // --- PATCH: Normalize envelope (result -> actions) and sequential execution with validation ---
-async function runActionsEnvelope(envelope) {
+async function runActionsEnvelope(envelope, context = {}) {
   // Normalize: accept legacy {result: {...}} as {actions: [result]}
   if (!envelope.actions && envelope.result) {
     envelope.actions = [envelope.result];
@@ -1029,19 +3369,62 @@ async function runActionsEnvelope(envelope) {
     throw new Error("runActionsEnvelope: envelope must have actions[] array");
   }
   const results = [];
+  const contextualAllowedActions = Array.isArray(context.allowedActions)
+    ? new Set(context.allowedActions.map((entry) => String(entry || '').trim()).filter(Boolean))
+    : null;
+  const executionContext = {
+    ...context,
+    conversationId: String(
+      context.conversationId ||
+      envelope.conversationId ||
+      envelope.convId ||
+      envelope.sessionId ||
+      ''
+    ).trim() || context.conversationId || null,
+  };
+  let lastArtifactPath = '';
+
+  const extractArtifactPathFromResult = (result) => String(
+    result?.outputPath
+    || result?.path
+    || result?.filePath
+    || result?.savedAs
+    || result?.zip?.outputPath
+    || result?.file?.path
+    || ''
+  ).trim();
+
   for (const a of envelope.actions) {
-    const name = a.action || a.name;
-    const args = a.arguments || a.input || {};
+    const rawName = a.action || a.name;
+    const name = normalizeDispatchActionName(rawName);
+    const args = normalizeDispatchActionArgs(name, {
+      ...(a.arguments || a.input || {}),
+      _context: executionContext,
+    });
+    if ((name === 'share_file' || name === 'send_email' || name === 'schedule_email') && !args.path && lastArtifactPath) {
+      args.path = lastArtifactPath;
+    }
     // Validation stricte du nom d'action
     const valid = validateActionName(name);
     if (!valid.ok) {
       results.push({
-        action: name,
+        action: rawName,
+        normalizedAction: name,
         ok: false,
         error: valid.error,
         available: valid.available
       });
       break; // Stop batch on invalid action
+    }
+    if (contextualAllowedActions && contextualAllowedActions.size && !contextualAllowedActions.has(name)) {
+      results.push({
+        action: rawName,
+        normalizedAction: name,
+        ok: false,
+        error: `ACTION_NOT_ALLOWED:${name}`,
+        allowed: [...contextualAllowedActions]
+      });
+      break;
     }
     if (isIgnoredMemoryKey(name, args)) {
       console.log("[A11][memory] Ignoring", name, "for reserved key:", args.key || args.input?.key);
@@ -1092,6 +3475,10 @@ async function runActionsEnvelope(envelope) {
     }
     try {
       const result = await TOOL_IMPL[name](args);
+      const nextArtifactPath = extractArtifactPathFromResult(result);
+      if (nextArtifactPath) {
+        lastArtifactPath = nextArtifactPath;
+      }
       results.push({ action: name, ok: true, result });
     } catch (err) {
       results.push({
@@ -1114,6 +3501,11 @@ module.exports = {
   t_a11_memory_history,
   t_download_file,
   t_qflush_flow,
+  t_qflush_memory_write,
+  t_qflush_memory_read,
+  t_qflush_memory_list,
+  t_qflush_memory_delete,
+  t_qflush_memory_clear,
   t_fs_read,
   t_fs_write,
   t_write_file,
@@ -1130,12 +3522,36 @@ module.exports = {
   t_llm_analyze_text,
   t_generate_pdf,
   t_generate_png,
+  t_vision_analyze,
+  t_share_file,
+  t_list_stored_files,
+  t_list_resources,
+  t_get_latest_resource,
+  t_email_resource,
+  t_email_latest_resource,
+  t_send_email,
+  t_schedule_email,
+  t_schedule_resource_email,
+  t_schedule_latest_resource_email,
+  t_list_scheduled_emails,
+  t_cancel_scheduled_email,
+  t_zip_and_email,
   t_vs_status,
+  t_vs_workspace_root,
+  t_vs_compilation_errors,
+  t_vs_project_structure,
+  t_vs_solution_info,
+  t_vs_active_document,
+  t_vs_current_selection,
   t_vs_open_file,
+  t_vs_goto_line,
+  t_vs_open_documents,
+  t_vs_execute_shell,
   t_vs_build_solution,
   t_a11_env_snapshot,
   t_a11_debug_echo,
   runAction,
   runActionsEnvelope,
-  isIgnoredMemoryKey
+  isIgnoredMemoryKey,
+  getAllowedActionNames
 };

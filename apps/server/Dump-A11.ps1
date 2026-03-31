@@ -1,5 +1,5 @@
 param(
-    [string]$Root = "D:\A11",                       # Racine de ton monorepo A-11
+    [string]$Root = (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))), # Racine canonique D:\funesterie\a11
     [string]$OutputDir = "$env:USERPROFILE\Desktop" # Où poser le zip
 )
 
@@ -21,21 +21,19 @@ if (-not (Test-Path $Root)) {
 
 Push-Location $Root
 
-# Fichiers/dossiers intéressants (code, pas les node_modules & co)
+# Fichiers/dossiers intéressants dans l'arborescence split actuelle
 $paths = @(
-    "apps\server\*",
-    "apps\web\*",
-    "A11.VisualStudio\*",
-    "llm-router.cjs",
-    "tools\*",
-    "src\*",
-    "start-a11-system.ps1",
-    "Start-A11-LaunchAll.ps1",
-    "start-all.ps1",
-    "package.json",
-    "package-lock.json",
-    "tsconfig.json",
-    ".env.example"
+    "a11backendrailway\apps\server\*",
+    "a11backendrailway\apps\tts\*",
+    "a11frontendnetlify\apps\web\*",
+    "a11qflushrailway\src\*",
+    "a11qflushrailway\docs\*",
+    "a11llm\llm\*",
+    "launchers\README.md",
+    "launchers\start-all-a11.bat",
+    "launchers\start-all-a11.ps1",
+    "launchers\start-prod-a11.bat",
+    "launchers\start-prod-a11.ps1"
 ) | Where-Object { Test-Path $_ }
 
 if ($paths.Count -eq 0) {

@@ -303,10 +303,12 @@ curl http://localhost:3000/api/v1/vs/open-documents
 #### POST `/api/v1/vs/execute-shell`
 Exécute une commande shell.
 
+Cette route est protegée par une whitelist de commandes safe.
+
 **Request:**
 ```json
 {
-  "command": "dotnet --version"
+  "command": "git status"
 }
 ```
 
@@ -314,7 +316,7 @@ Exécute une commande shell.
 ```sh
 curl -X POST http://localhost:3000/api/v1/vs/execute-shell \
   -H "Content-Type: application/json" \
-  -d '{"command":"dotnet --version"}'
+  -d '{"command":"git status"}'
 ```
 
 ---

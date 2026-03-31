@@ -99,6 +99,9 @@ console.log("[Cerbère] Workspace root:", WORKSPACE_ROOT);
 const BACKENDS = {
   openai: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
 };
+const DEFAULT_OPENAI_MODEL = String(process.env.OPENAI_MODEL || process.env.A11_OPENAI_MODEL || "gpt-4o-mini").trim() || "gpt-4o-mini";
+const THINKER_MODEL = String(process.env.CERBERE_THINKER_MODEL || DEFAULT_OPENAI_MODEL).trim() || DEFAULT_OPENAI_MODEL;
+const MAKER_MODEL = String(process.env.CERBERE_MAKER_MODEL || DEFAULT_OPENAI_MODEL).trim() || DEFAULT_OPENAI_MODEL;
 
 logInfo("[Cerbère] Backends configurés: " + JSON.stringify(BACKENDS));
 
@@ -167,10 +170,10 @@ async function callStrategist(userPrompt) {
 }
 
 async function callThinker(prompt) {
-  logThinker("[Cerbère][THINKER] GPT-4.1 engagé pour analyse");
+  logThinker(`[Cerbère][THINKER] ${THINKER_MODEL} engagé pour analyse`);
 
   const backendURL = buildOpenAICompletionsUrl(BACKENDS.openai);
-  const body = { model: "gpt-4.1", messages: [{ role: "user", content: prompt }] };
+  const body = { model: THINKER_MODEL, messages: [{ role: "user", content: prompt }] };
 
   try {
     const resp = await fetch(backendURL, {
@@ -189,12 +192,12 @@ async function callThinker(prompt) {
 }
 
 async function callMaker(input) {
-  logMaker("[Cerbère][MAKER] OpenAI engagé pour exécution");
+  logMaker(`[Cerbère][MAKER] ${MAKER_MODEL} engagé pour exécution`);
 
   const backendURL = buildOpenAICompletionsUrl(BACKENDS.openai);
   const messages = Array.isArray(input) ? input : [{ role: "user", content: input }];
 
-  const body = { model: "gpt-4o-mini", messages };
+  const body = { model: MAKER_MODEL, messages };
 
   try {
     const resp = await fetch(backendURL, {
@@ -383,7 +386,7 @@ function guessContentType(filePath) {
 async function fetchInternalJson(pathname, options = {}, context = {}) {
   const authToken = getAuthTokenFromContext(context);
   if (!authToken) {
-    throw new Error("share_file requires authenticated user context");
+    throw new Error("authenticated user context required");
   }
 
   const url = `${getInternalApiBaseUrl()}${pathname}`;
@@ -406,6 +409,58 @@ async function fetchInternalJson(pathname, options = {}, context = {}) {
   return data;
 }
 
+function listAttachmentPaths(msg = {}) {
+  const items = [];
+  if (typeof msg.path === "string" && msg.path.trim()) items.push(msg.path);
+  if (typeof msg.attachmentPath === "string" && msg.attachmentPath.trim()) items.push(msg.attachmentPath);
+  if (typeof msg.filePath === "string" && msg.filePath.trim()) items.push(msg.filePath);
+  if (typeof msg.outputPath === "string" && msg.outputPath.trim()) items.push(msg.outputPath);
+  if (Array.isArray(msg.paths)) items.push(...msg.paths);
+  if (Array.isArray(msg.attachments)) {
+    for (const item of msg.attachments) {
+      if (typeof item === "string" && item.trim()) items.push(item);
+      else if (item && typeof item === "object" && typeof item.path === "string" && item.path.trim()) items.push(item.path);
+    }
+  }
+  return Array.from(new Set(items.map((item) => String(item || "").trim()).filter(Boolean)));
+}
+
+function normalizeRecipientsInput(value) {
+  if (Array.isArray(value)) {
+    return Array.from(new Set(
+      value
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    ));
+  }
+
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+  return Array.from(new Set(
+    raw
+      .split(/[;,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  ));
+}
+
+function buildAttachmentPayload(fullPath, index = 0, forcedFilename = "") {
+  if (!fs.existsSync(fullPath)) {
+    throw new Error(`attachment file not found: ${fullPath}`);
+  }
+  const stats = fs.statSync(fullPath);
+  if (!stats.isFile()) {
+    throw new Error(`attachment path is not a file: ${fullPath}`);
+  }
+  const buffer = fs.readFileSync(fullPath);
+  return {
+    filename: forcedFilename && index === 0 ? String(forcedFilename).trim() : path.basename(fullPath),
+    contentBase64: buffer.toString("base64"),
+    contentType: guessContentType(fullPath),
+    sizeBytes: stats.size,
+  };
+}
+
 async function handleShareFile(msg) {
   const context = msg._context || {};
   const full = resolveSafePath(msg.path);
@@ -414,11 +469,12 @@ async function handleShareFile(msg) {
   if (!stats.isFile()) return { ok: false, error: "Path is not a file", path: full };
 
   const buffer = fs.readFileSync(full);
+  const recipients = normalizeRecipientsInput(msg.emailTo || msg.to || msg.email || msg.recipient || msg.recipients || "");
   const payload = {
     filename: msg.filename || path.basename(full),
     contentBase64: buffer.toString("base64"),
     contentType: msg.contentType || guessContentType(full),
-    emailTo: msg.emailTo || msg.to || "",
+    emailTo: recipients.length ? recipients : "",
     emailSubject: msg.emailSubject || msg.subject || "",
     emailMessage: msg.emailMessage || msg.message || "",
     attachToEmail: msg.attachToEmail === true || msg.asAttachment === true,
@@ -451,6 +507,109 @@ async function handleListStoredFiles(msg) {
   const result = await fetchInternalJson(`/api/files/my?limit=${limit}`, { method: "GET" }, context);
   if (result?.ok) return result;
   return { ok: false, error: result?.error || result?.message || "list_stored_files_failed", detail: result };
+}
+
+async function handleListResources(msg) {
+  const context = msg._context || {};
+  const limit = Number.isFinite(Number(msg.limit)) ? Math.max(1, Math.min(100, Number(msg.limit))) : 20;
+  const search = new URLSearchParams();
+  search.set("limit", String(limit));
+  if (String(msg.conversationId || msg.convId || msg.sessionId || "").trim()) {
+    search.set("conversationId", String(msg.conversationId || msg.convId || msg.sessionId).trim());
+  }
+  if (String(msg.kind || msg.resourceKind || "").trim()) {
+    search.set("kind", String(msg.kind || msg.resourceKind).trim());
+  }
+  const result = await fetchInternalJson(`/api/resources/my?${search.toString()}`, { method: "GET" }, context);
+  if (result?.ok) return result;
+  return { ok: false, error: result?.error || result?.message || "list_resources_failed", detail: result };
+}
+
+async function handleEmailResource(msg) {
+  const context = msg._context || {};
+  const resourceId = Number(msg.resourceId || msg.resource_id || msg.id || msg.conversationResourceId || 0);
+  if (!Number.isFinite(resourceId) || resourceId <= 0) {
+    throw new Error("email_resource: missing valid \"resourceId\"");
+  }
+
+  const recipients = normalizeRecipientsInput(msg.to || msg.emailTo || msg.email || msg.recipient || msg.recipients || "");
+  if (!recipients.length) {
+    throw new Error("email_resource: missing \"to\"");
+  }
+
+  const result = await fetchInternalJson("/api/resources/email", {
+    method: "POST",
+    body: {
+      resourceId,
+      to: recipients,
+      subject: msg.subject || msg.emailSubject || "",
+      message: msg.message || msg.emailMessage || msg.body || msg.text || "",
+      attachToEmail: msg.attachToEmail === true || msg.asAttachment === true || msg.attach === true,
+    },
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      resourceId,
+      to: recipients,
+      mail: result.mail || null,
+      resource: result.resource || null,
+    };
+  }
+
+  return {
+    ok: false,
+    resourceId,
+    to: recipients,
+    error: result?.error || result?.message || "email_resource_failed",
+    detail: result,
+  };
+}
+
+async function handleSendEmail(msg) {
+  const context = msg._context || {};
+  const recipients = normalizeRecipientsInput(msg.to || msg.emailTo || msg.email || msg.recipient || msg.recipients || "");
+  if (!recipients.length) {
+    throw new Error("send_email: missing \"to\"");
+  }
+
+  const includeAttachments = msg.attachToEmail !== false;
+  const attachmentPaths = includeAttachments ? listAttachmentPaths(msg) : [];
+  const attachments = attachmentPaths.map((candidate, index) => {
+    const fullPath = resolveSafePath(candidate);
+    return buildAttachmentPayload(fullPath, index, msg.filename || "");
+  });
+
+  const result = await fetchInternalJson("/api/mail/send", {
+    method: "POST",
+    body: {
+      to: recipients,
+      subject: msg.subject || msg.emailSubject || "A11",
+      message: msg.message || msg.emailMessage || msg.body || msg.text || msg.content || "",
+      html: msg.html || "",
+      conversationId: msg.conversationId || msg.convId || msg.sessionId || null,
+      attachments,
+    },
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      to: recipients,
+      subject: msg.subject || msg.emailSubject || "A11",
+      attachmentCount: attachments.length,
+      mail: result.mail || null,
+    };
+  }
+
+  return {
+    ok: false,
+    to: recipients,
+    subject: msg.subject || msg.emailSubject || "A11",
+    error: result?.error || result?.message || "send_email_failed",
+    detail: result,
+  };
 }
 
 function handleDeleteFile(msg) {
@@ -563,6 +722,66 @@ const ROUTER_TOOL_REGISTRY = [
       properties: {
         limit: { type: "number" },
       },
+      additionalProperties: true,
+    },
+  },
+  {
+    name: "list_resources",
+    description: "Liste les ressources de conversation déjà stockées pour l'utilisateur courant.",
+    schema: {
+      type: "object",
+      properties: {
+        conversationId: { type: "string" },
+        kind: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: true,
+    },
+  },
+  {
+    name: "email_resource",
+    description: "Envoie une ressource déjà stockée par A11 par email à partir de son resourceId.",
+    schema: {
+      type: "object",
+      properties: {
+        resourceId: { type: "number" },
+        to: {
+          oneOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+        subject: { type: "string" },
+        message: { type: "string" },
+        attachToEmail: { type: "boolean" },
+      },
+      required: ["resourceId", "to"],
+      additionalProperties: true,
+    },
+  },
+  {
+    name: "send_email",
+    description: "Envoie un email texte avec pièces jointes locales optionnelles.",
+    schema: {
+      type: "object",
+      properties: {
+        to: {
+          oneOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+        subject: { type: "string" },
+        message: { type: "string" },
+        html: { type: "string" },
+        path: { type: "string" },
+        paths: {
+          type: "array",
+          items: { type: "string" },
+        },
+        attachToEmail: { type: "boolean" },
+      },
+      required: ["to"],
       additionalProperties: true,
     },
   },
@@ -943,8 +1162,8 @@ ${userPrompt}
   }
 });
 
-// module.exports = router pour usage dans server.cjs ou ailleurs
-module.exports = router;
+// Exporte à la fois le router et BACKENDS pour usage externe
+module.exports = { router, BACKENDS };
 
 // Ajoute la whitelist en haut du fichier
 const MODULES_WHITELIST = new Set([
@@ -1031,6 +1250,20 @@ async function handleDevAction(msg = {}) {
       case "list-stored-files":
       case "list_files":
         return await handleListStoredFiles(msg);
+      case "list_resources":
+      case "list-resource":
+      case "list_resource":
+      case "list_conversation_resources":
+        return await handleListResources(msg);
+      case "email_resource":
+      case "email-resource":
+      case "send_resource_email":
+      case "resource_email":
+        return await handleEmailResource(msg);
+      case "send_email":
+      case "send-email":
+      case "send_mail":
+        return await handleSendEmail(msg);
       case "shell_exec":
       case "shell-exec":
         return await shell_exec(msg);
