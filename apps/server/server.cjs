@@ -10639,6 +10639,12 @@ async function proxyChatToOpenAI(req, res) {
     upstreamBody.providerConfig = remoteProviderConfig;
     upstreamBody.model = getResolvedRemoteModelForRequest(upstreamBody, remoteProviderConfig.model);
   }
+  if (provider !== 'local' && !String(upstreamBody.model || '').trim()) {
+    upstreamBody.model = getResolvedRemoteModelForRequest(
+      upstreamBody,
+      remoteProviderConfig?.model || process.env.OPENAI_MODEL || process.env.A11_OPENAI_MODEL || 'gpt-4o-mini'
+    );
+  }
 
   if (userId) {
     const memoryContext = await loadUserMemoryContext(userId, latestUserMessage, conversationId);

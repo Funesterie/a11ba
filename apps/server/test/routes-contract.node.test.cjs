@@ -186,12 +186,14 @@ test('POST /api/llm/chat does not force provider=local when a remote provider is
   const jwtSecret = 'test-secret';
   const token = jwt.sign({ id: 'user-1', username: 'user-1' }, jwtSecret, { expiresIn: '1h' });
   const previousOpenAiApiKey = process.env.OPENAI_API_KEY;
+  const previousOpenAiModel = process.env.OPENAI_MODEL;
   const previousLocalLlmUrl = process.env.LOCAL_LLM_URL;
   const previousLocalMode = process.env.A11_LOCAL_MODE;
   const previousRuntimeProfile = process.env.A11_RUNTIME_PROFILE;
   const previousDefaultUpstream = process.env.DEFAULT_UPSTREAM;
 
   process.env.OPENAI_API_KEY = 'test-openai-key';
+  process.env.OPENAI_MODEL = 'test-remote-model';
   process.env.LOCAL_LLM_URL = 'http://127.0.0.1:8080';
   delete process.env.A11_LOCAL_MODE;
   delete process.env.A11_RUNTIME_PROFILE;
@@ -232,12 +234,14 @@ test('POST /api/llm/chat does not force provider=local when a remote provider is
 
         assert.equal(response.status, 200);
         assert.equal(json.provider, null);
-        assert.equal(json.model, null);
+        assert.equal(json.model, 'test-remote-model');
       }
     );
   } finally {
     if (previousOpenAiApiKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = previousOpenAiApiKey;
+    if (previousOpenAiModel === undefined) delete process.env.OPENAI_MODEL;
+    else process.env.OPENAI_MODEL = previousOpenAiModel;
     if (previousLocalLlmUrl === undefined) delete process.env.LOCAL_LLM_URL;
     else process.env.LOCAL_LLM_URL = previousLocalLlmUrl;
     if (previousLocalMode === undefined) delete process.env.A11_LOCAL_MODE;

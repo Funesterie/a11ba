@@ -44,6 +44,11 @@ function createProtectedChatProxyRouter({
   hasLocalChatUpstreamConfigured = defaultHasLocalChatUpstreamConfigured,
   shouldDefaultToLocalProvider = defaultShouldDefaultToLocalProvider,
   localDefaultModel = String(process.env.LOCAL_DEFAULT_MODEL || 'llama3.2:latest'),
+  remoteDefaultModel = String(
+    process.env.OPENAI_MODEL
+    || process.env.A11_OPENAI_MODEL
+    || 'gpt-4o-mini'
+  ).trim() || 'gpt-4o-mini',
 } = {}) {
   if (typeof verifyJWT !== 'function') {
     throw new Error('createProtectedChatProxyRouter requires verifyJWT');
@@ -98,6 +103,9 @@ function createProtectedChatProxyRouter({
     }
     if (req.body.provider === 'local' && !String(req.body.model || '').trim()) {
       req.body.model = String(localDefaultModel || 'llama3.2:latest');
+    }
+    if (req.body.provider !== 'local' && !String(req.body.model || '').trim()) {
+      req.body.model = String(remoteDefaultModel || 'gpt-4o-mini');
     }
   }
 
